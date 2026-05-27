@@ -1,19 +1,38 @@
 use std::{marker::PhantomData, pin::Pin, sync::Arc};
 
-use axum_core::{extract::Request, response::Response};
+use axum_core::{
+    extract::Request,
+    response::{IntoResponse, Response},
+};
 use http::StatusCode;
-use huskarl_resource_server::error::InsufficientScope;
+use huskarl_resource_server::error::{InsufficientScope, ToRfc6750Error as _, TokenErrorCode};
 use tower::{Layer, Service};
 
-use crate::extensions::{AncestorRequiredScopes, ValidatedToken, ValidatorData};
-use crate::layers::validator::challenge_response;
+use crate::extensions::{AncestorRequiredScopes, ValidatorData};
+use crate::extractors::ValidatedToken;
+use crate::layers::validator::{FailureDetails, challenge_response};
 use crate::response::ErrorBody;
 
+/// Exposes the scopes granted to a token, for [`RequireScopesLayer`] enforcement.
+///
+/// Implement this on your claims type. Return the token's granted scopes
+/// (typically the space-delimited `scope` claim split into a `Vec`), or `None`
+/// when the token carries no `scope` claim — treated as no scopes granted.
 pub trait HasScopes {
+    /// Returns the scopes granted to the token, or `None` if it has no `scope`
+    /// claim.
     fn scopes(&self) -> Option<Vec<String>>;
 }
 
-
+/// Enforces that the validated token carries every scope in `required_scopes`.
+///
+/// Must be stacked **inside** a [`ValidatorLayer`](super::ValidatorLayer): it
+/// reads `ValidatorData` and (optionally) `ValidatedToken<C>` from request
+/// extensions. If those are missing, the request short-circuits with a
+/// `500 Internal Server Error` rather than panicking — this almost always
+/// indicates a middleware-ordering bug. Construct via
+/// `ValidatorLayer::claims_context().require_scopes(...)` to make the
+/// ordering implicit.
 #[derive(Clone)]
 pub struct RequireScopesLayer<C, E: ErrorBody = ()> {
     required_scopes: Vec<String>,
@@ -22,6 +41,12 @@ pub struct RequireScopesLayer<C, E: ErrorBody = ()> {
 }
 
 impl<C> RequireScopesLayer<C> {
+    /// Creates a layer requiring every scope in `scopes` (AND-combined).
+    ///
+    /// Must sit inside a [`ValidatorLayer`](super::ValidatorLayer); prefer
+    /// `ValidatorLayer::claims_context().require_scopes(...)`, which makes that
+    /// ordering implicit.
+    #[must_use]
     pub fn new(scopes: Vec<String>) -> Self {
         RequireScopesLayer {
             required_scopes: scopes,
@@ -49,6 +74,8 @@ impl<C, E: ErrorBody, S> Layer<S> for RequireScopesLayer<C, E> {
     }
 }
 
+/// The [`Service`] produced by [`RequireScopesLayer`]; you don't
+/// normally name this directly.
 #[derive(Clone)]
 pub struct RequireScopesService<C, E: ErrorBody, S> {
     inner: S,
@@ -58,6 +85,8 @@ pub struct RequireScopesService<C, E: ErrorBody, S> {
 }
 
 impl<C, E: ErrorBody, S> RequireScopesService<C, E, S> {
+    /// Constructs the service directly; normally produced by
+    /// [`RequireScopesLayer`]'s [`Layer`] impl.
     pub fn new(inner: S, scopes: Vec<String>, error_body: Option<E>) -> Self {
         Self {
             inner,
@@ -107,10 +136,15 @@ where
             req.extensions_mut()
                 .insert(AncestorRequiredScopes(all_required_scopes.clone()));
 
-            let validator_data = req
-                .extensions()
-                .get::<ValidatorData>()
-                .expect("Validator must be base layer");
+            let Some(validator_data) = req.extensions().get::<ValidatorData>() else {
+                // ValidatorData is only inserted by ValidatorLayer. Missing it means
+                // RequireScopesLayer is stacked outside (or without) a validator —
+                // a configuration bug. Fail closed with 500 instead of panicking so a
+                // single misconfigured route can't take the whole server down.
+                let mut resp = http::Response::new(axum_core::body::Body::empty());
+                *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                return Ok(resp.into_response());
+            };
 
             let Some(token) = req.extensions().get::<ValidatedToken<C>>() else {
                 // We do not know all the claims for the route, so we'll have to just return what we know.
@@ -118,9 +152,17 @@ where
                 let challenges = validator_data
                     .inner
                     .unauthenticated_challenges(Some(&all_required_scopes.join(" ")));
+                // Unauthenticated, so no error code (RFC 6750 §3.1) — but the
+                // required scopes are known and worth passing to the body.
+                let details = FailureDetails {
+                    error_code: None,
+                    error_description: None,
+                    required_scopes: Some(all_required_scopes.clone()),
+                };
                 return Ok(challenge_response(
                     &error_body,
                     StatusCode::UNAUTHORIZED,
+                    &details,
                     challenges,
                     None,
                 ));
@@ -131,14 +173,23 @@ where
             // N^2, should be cheaper than constructing a HashSet for small N?
             for scp in &required_scopes {
                 if !scopes.contains(scp) {
+                    let insufficient = InsufficientScope {
+                        scope: Some(scp.clone()),
+                    };
                     let challenges = validator_data.inner.challenges(
-                        Some(&InsufficientScope),
+                        Some(&insufficient),
                         Some(&all_required_scopes.join(" ")),
                         None,
                     );
+                    let details = FailureDetails {
+                        error_code: Some(TokenErrorCode::InsufficientScope),
+                        error_description: insufficient.error_description(),
+                        required_scopes: Some(all_required_scopes.clone()),
+                    };
                     return Ok(challenge_response(
                         &error_body,
                         StatusCode::FORBIDDEN,
+                        &details,
                         challenges,
                         None,
                     ));

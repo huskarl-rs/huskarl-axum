@@ -3,16 +3,36 @@ name = "huskarl-axum"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+login = ["dep:huskarl", "dep:base64", "dep:bytes", "dep:huskarl-login", "dep:log", "dep:serde", "dep:serde_html_form"]
+
 [dependencies]
 axum-core = { version = "0.5", default-features = false }
 bon = { version = "3.9", features = ["experimental-generics-setters"] }
 http = { version = "1", default-features = false }
-huskarl-resource-server = "0.7"
+huskarl-resource-server = { version = "0.10", path = "../huskarl/huskarl-resource-server" }
 serde_json = { version = "1", default-features = false }
 tower = { version = "0.5", default-features = false }
 
+# login feature
+base64 = { version = "0.22", optional = true }
+bytes = { version = "1", optional = true }
+huskarl = { version = "0.10", default-features = false, optional = true }
+huskarl-login = { path = "../huskarl-login", optional = true }
+log = { version = "0.4", optional = true }
+serde = { version = "1", optional = true, features = ["derive"] }
+serde_html_form = { version = "0.4", optional = true }
+
 [dev-dependencies]
 axum = { version = "0.8", features = ["macros"] }
-huskarl-reqwest = { version = "0.6", features = ["rustls-tls"] }
-serde = "1"
-tokio = { version = "1", features = ["full"] }
+env_logger = "0.11"
+tower = { version = "0.5", features = ["util"] }
+huskarl-crypto-native = { version = "0.10" }
+huskarl-reqwest = { version = "0.8", path = "../huskarl/huskarl-reqwest", features = ["rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full", "test-util"] }
+url = "2"
+
+[[example]]
+name = "login"
+required-features = ["login"]
