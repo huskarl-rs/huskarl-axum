@@ -33,8 +33,8 @@ use crate::response::ErrorBody;
 /// layer is stacked outside, or without, a validator) the request short-circuits
 /// with `500 Internal Server Error` rather than panicking — almost always a
 /// middleware-ordering bug. Prefer
-/// [`ValidatorLayer::require_authenticated`](super::ValidatorLayer::require_authenticated),
-/// which carries the validator's error body and makes the ordering implicit.
+/// [`ValidatorLayer::authenticated`](super::ValidatorLayer::authenticated),
+/// which returns an order-safe composite layer.
 #[derive(Clone)]
 pub struct RequireAuthenticatedLayer<E: ErrorBody = ()> {
     error_body: Option<E>,
@@ -44,8 +44,8 @@ impl RequireAuthenticatedLayer {
     /// Creates a layer that rejects requests without a valid token.
     ///
     /// Must sit inside a [`ValidatorLayer`](super::ValidatorLayer); prefer
-    /// [`ValidatorLayer::require_authenticated`](super::ValidatorLayer::require_authenticated),
-    /// which makes that ordering implicit and reuses the validator's error body.
+    /// [`ValidatorLayer::authenticated`](super::ValidatorLayer::authenticated),
+    /// which guarantees the ordering and reuses the validator's error body.
     #[must_use]
     pub fn new() -> Self {
         Self { error_body: None }
@@ -131,6 +131,7 @@ where
                     StatusCode::UNAUTHORIZED,
                     &FailureDetails::unauthenticated(),
                     challenges,
+                    None,
                     None,
                 ));
             }

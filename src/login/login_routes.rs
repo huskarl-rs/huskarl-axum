@@ -3,7 +3,10 @@
 use std::{pin::Pin, sync::Arc};
 
 use axum_core::{extract::Request, response::Response};
-use huskarl_login::{SessionDriver, engine::LoginEngine};
+use huskarl_login::{
+    SessionDriver,
+    engine::{LoginEngine, is_cors_preflight},
+};
 use tower::{Layer, Service};
 
 use super::layer::{effective_uri, to_response};
@@ -15,11 +18,23 @@ use super::layer::{effective_uri, to_response};
 /// callback / logout responses are not themselves gated.
 pub struct LoginRoutesLayer<SD> {
     engine: Arc<LoginEngine<SD>>,
+    cors_passthrough: bool,
 }
 
 impl<SD> LoginRoutesLayer<SD> {
+    #[cfg(test)]
     pub(super) fn new(engine: Arc<LoginEngine<SD>>) -> Self {
-        Self { engine }
+        Self::with_cors_passthrough(engine, true)
+    }
+
+    pub(super) fn with_cors_passthrough(
+        engine: Arc<LoginEngine<SD>>,
+        cors_passthrough: bool,
+    ) -> Self {
+        Self {
+            engine,
+            cors_passthrough,
+        }
     }
 }
 
@@ -27,6 +42,7 @@ impl<SD> Clone for LoginRoutesLayer<SD> {
     fn clone(&self) -> Self {
         Self {
             engine: self.engine.clone(),
+            cors_passthrough: self.cors_passthrough,
         }
     }
 }
@@ -38,6 +54,7 @@ impl<SD, S> Layer<S> for LoginRoutesLayer<SD> {
         LoginRoutesService {
             inner,
             engine: self.engine.clone(),
+            cors_passthrough: self.cors_passthrough,
         }
     }
 }
@@ -46,6 +63,7 @@ impl<SD, S> Layer<S> for LoginRoutesLayer<SD> {
 pub struct LoginRoutesService<SD, S> {
     inner: S,
     engine: Arc<LoginEngine<SD>>,
+    cors_passthrough: bool,
 }
 
 impl<SD, S: Clone> Clone for LoginRoutesService<SD, S> {
@@ -53,6 +71,7 @@ impl<SD, S: Clone> Clone for LoginRoutesService<SD, S> {
         Self {
             inner: self.inner.clone(),
             engine: self.engine.clone(),
+            cors_passthrough: self.cors_passthrough,
         }
     }
 }
@@ -78,8 +97,13 @@ where
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
         let engine = self.engine.clone();
+        let cors_passthrough = self.cors_passthrough;
 
         Box::pin(async move {
+            if cors_passthrough && is_cors_preflight(req.method(), req.headers()) {
+                return inner.call(req).await;
+            }
+
             let (parts, body) = req.into_parts();
             let uri = effective_uri(&parts);
 

@@ -13,15 +13,21 @@ use crate::extractors::ValidatedToken;
 use crate::layers::validator::{FailureDetails, challenge_response};
 use crate::response::ErrorBody;
 
-/// Exposes the scopes granted to a token, for [`RequireScopesLayer`] enforcement.
+/// Checks the scopes granted to a token, for [`RequireScopesLayer`] enforcement.
 ///
-/// Implement this on your claims type. Return the token's granted scopes
-/// (typically the space-delimited `scope` claim split into a `Vec`), or `None`
-/// when the token carries no `scope` claim — treated as no scopes granted.
+/// Implement this on your claims type. Scope comparisons must be exact: a
+/// granted `read-all` scope must not satisfy a requirement for `read`.
 pub trait HasScopes {
-    /// Returns the scopes granted to the token, or `None` if it has no `scope`
-    /// claim.
-    fn scopes(&self) -> Option<Vec<String>>;
+    /// Returns whether the token grants `scope`.
+    fn has_scope(&self, scope: &str) -> bool;
+}
+
+impl<E> HasScopes for huskarl_resource_server::validator::rfc9068::Rfc9068AccessTokenClaims<E> {
+    fn has_scope(&self, scope: &str) -> bool {
+        self.scope
+            .as_ref()
+            .is_some_and(|granted| granted.split_whitespace().any(|token| token == scope))
+    }
 }
 
 /// Enforces that the validated token carries every scope in `required_scopes`.
@@ -30,9 +36,9 @@ pub trait HasScopes {
 /// reads `ValidatorData` and (optionally) `ValidatedToken<C>` from request
 /// extensions. If those are missing, the request short-circuits with a
 /// `500 Internal Server Error` rather than panicking — this almost always
-/// indicates a middleware-ordering bug. Construct via
-/// `ValidatorLayer::claims_context().require_scopes(...)` to make the
-/// ordering implicit.
+/// indicates a middleware-ordering bug. Prefer
+/// [`ValidatorLayer::require_scopes`](super::ValidatorLayer::require_scopes),
+/// which composes validation and scope enforcement in the correct order.
 #[derive(Clone)]
 pub struct RequireScopesLayer<C, E: ErrorBody = ()> {
     required_scopes: Vec<String>,
@@ -43,9 +49,9 @@ pub struct RequireScopesLayer<C, E: ErrorBody = ()> {
 impl<C> RequireScopesLayer<C> {
     /// Creates a layer requiring every scope in `scopes` (AND-combined).
     ///
-    /// Must sit inside a [`ValidatorLayer`](super::ValidatorLayer); prefer
-    /// `ValidatorLayer::claims_context().require_scopes(...)`, which makes that
-    /// ordering implicit.
+    /// Must sit inside a [`ValidatorLayer`](super::ValidatorLayer); prefer its
+    /// [`require_scopes`](super::ValidatorLayer::require_scopes) method, which
+    /// returns an order-safe composite layer.
     #[must_use]
     pub fn new(scopes: Vec<String>) -> Self {
         RequireScopesLayer {
@@ -76,7 +82,6 @@ impl<C, E: ErrorBody, S> Layer<S> for RequireScopesLayer<C, E> {
 
 /// The [`Service`] produced by [`RequireScopesLayer`]; you don't
 /// normally name this directly.
-#[derive(Clone)]
 pub struct RequireScopesService<C, E: ErrorBody, S> {
     inner: S,
     required_scopes: Vec<String>,
@@ -84,10 +89,21 @@ pub struct RequireScopesService<C, E: ErrorBody, S> {
     phantom: PhantomData<C>,
 }
 
+impl<C, E: ErrorBody, S: Clone> Clone for RequireScopesService<C, E, S> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            required_scopes: self.required_scopes.clone(),
+            error_body: self.error_body.clone(),
+            phantom: PhantomData,
+        }
+    }
+}
+
 impl<C, E: ErrorBody, S> RequireScopesService<C, E, S> {
     /// Constructs the service directly; normally produced by
     /// [`RequireScopesLayer`]'s [`Layer`] impl.
-    pub fn new(inner: S, scopes: Vec<String>, error_body: Option<E>) -> Self {
+    fn new(inner: S, scopes: Vec<String>, error_body: Option<E>) -> Self {
         Self {
             inner,
             required_scopes: scopes,
@@ -165,25 +181,23 @@ where
                     &details,
                     challenges,
                     None,
+                    None,
                 ));
             };
 
-            let scopes: Vec<_> = token.claims.scopes().unwrap_or_default();
-
-            // N^2, should be cheaper than constructing a HashSet for small N?
             for scp in &required_scopes {
-                if !scopes.contains(scp) {
-                    let insufficient = InsufficientScope {
-                        scope: Some(scp.clone()),
-                    };
-                    let challenges = validator_data.inner.challenges(
-                        Some(&insufficient),
+                if !token.claims.has_scope(scp) {
+                    let insufficient = InsufficientScope::new(scp.clone());
+                    let challenge = insufficient.challenge();
+                    let challenges = validator_data.inner.challenges_from(
+                        insufficient.attempted_scheme(),
+                        Some(&challenge),
                         Some(&all_required_scopes.join(" ")),
                         None,
                     );
                     let details = FailureDetails {
                         error_code: Some(TokenErrorCode::InsufficientScope),
-                        error_description: insufficient.error_description(),
+                        error_description: challenge.description,
                         required_scopes: Some(all_required_scopes.clone()),
                     };
                     return Ok(challenge_response(
@@ -192,11 +206,44 @@ where
                         &details,
                         challenges,
                         None,
+                        None,
                     ));
                 }
             }
 
             inner.call(req).await
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use huskarl_resource_server::validator::rfc9068::Rfc9068AccessTokenClaims;
+
+    use super::HasScopes as _;
+
+    fn claims(scope: Option<&str>) -> Rfc9068AccessTokenClaims {
+        Rfc9068AccessTokenClaims {
+            client_id: "client".into(),
+            auth_time: None,
+            acr: None,
+            amr: Vec::new(),
+            scope: scope.map(str::to_owned),
+            extra_claims: (),
+        }
+    }
+
+    #[test]
+    fn rfc9068_scopes_are_exact_space_separated_tokens() {
+        let claims = claims(Some("read  write-all"));
+
+        assert!(claims.has_scope("read"));
+        assert!(claims.has_scope("write-all"));
+        assert!(!claims.has_scope("write"));
+    }
+
+    #[test]
+    fn rfc9068_missing_scope_grants_nothing() {
+        assert!(!claims(None).has_scope("read"));
     }
 }

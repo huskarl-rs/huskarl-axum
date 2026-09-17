@@ -19,11 +19,10 @@
 //!   - `COOKIE_KEY`    — 32-byte AES-256 key, hex-encoded (required)
 //!   - `LISTEN`        — Listen address (default: `0.0.0.0:3000`)
 
-use std::sync::Arc;
-
 use axum::{Router, routing::get};
 use huskarl::{
     core::{
+        crypto::seal::AeadV1Sealer,
         jwk::{JwksSource, OctBytes},
         secrets::{EnvVarSecret, Secret as _, encodings::HexEncoding},
         server_metadata::AuthorizationServerMetadata,
@@ -74,9 +73,7 @@ async fn main() {
         .client_auth(NoAuth)
         .http_client(http_client.clone())
         .redirect_uri(redirect_uri.clone())
-        .jws_verifier_factory(Arc::new(
-            JwksSource::builder().http_client(http_client).build(),
-        ))
+        .jws_verifier_factory(JwksSource::builder().http_client(http_client).build())
         .build()
         .await
         .expect("failed to build authorization code grant");
@@ -92,7 +89,7 @@ async fn main() {
     // The session store owns the cipher; `LoginLayer` reuses it for the
     // login-state cookie by default (see below), so the key lives in one place.
     let session_store: CookieSessionStore = CookieSessionStore::builder()
-        .sealer(sealer)
+        .sealer(AeadV1Sealer::new(sealer))
         .cookie_name("huskarl_session".parse().unwrap())
         .cookie_path("/".parse().unwrap())
         .build();
@@ -100,7 +97,6 @@ async fn main() {
     let login_config = LoginConfig::builder()
         .callback_path(parsed_redirect.path().to_owned())
         .scope(vec!["openid".to_owned()])
-        .base_url(base_url.parse().expect("valid base URL"))
         .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
         .logout(
             LogoutConfig::builder()
@@ -116,8 +112,8 @@ async fn main() {
         .config(login_config)
         .grant(grant)
         .session_store(session_store)
-        .sealer(sealer)
-        .build();
+        .build()
+        .expect("failed to build login layer");
 
     let app = Router::new().route("/", get(index)).layer(login);
 

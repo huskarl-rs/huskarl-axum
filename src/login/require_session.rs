@@ -41,11 +41,25 @@ pub enum UnauthenticatedAction {
 pub struct RequireSessionLayer<SD> {
     engine: Arc<LoginEngine<SD>>,
     action: UnauthenticatedAction,
+    cors_passthrough: bool,
 }
 
 impl<SD> RequireSessionLayer<SD> {
+    #[cfg(test)]
     pub(super) fn new(engine: Arc<LoginEngine<SD>>, action: UnauthenticatedAction) -> Self {
-        Self { engine, action }
+        Self::with_cors_passthrough(engine, action, true)
+    }
+
+    pub(super) fn with_cors_passthrough(
+        engine: Arc<LoginEngine<SD>>,
+        action: UnauthenticatedAction,
+        cors_passthrough: bool,
+    ) -> Self {
+        Self {
+            engine,
+            action,
+            cors_passthrough,
+        }
     }
 }
 
@@ -54,6 +68,7 @@ impl<SD> Clone for RequireSessionLayer<SD> {
         Self {
             engine: self.engine.clone(),
             action: self.action,
+            cors_passthrough: self.cors_passthrough,
         }
     }
 }
@@ -66,6 +81,7 @@ impl<SD, S> Layer<S> for RequireSessionLayer<SD> {
             inner,
             engine: self.engine.clone(),
             action: self.action,
+            cors_passthrough: self.cors_passthrough,
         }
     }
 }
@@ -75,6 +91,7 @@ pub struct RequireSessionService<SD, S> {
     inner: S,
     engine: Arc<LoginEngine<SD>>,
     action: UnauthenticatedAction,
+    cors_passthrough: bool,
 }
 
 impl<SD, S: Clone> Clone for RequireSessionService<SD, S> {
@@ -83,6 +100,7 @@ impl<SD, S: Clone> Clone for RequireSessionService<SD, S> {
             inner: self.inner.clone(),
             engine: self.engine.clone(),
             action: self.action,
+            cors_passthrough: self.cors_passthrough,
         }
     }
 }
@@ -109,9 +127,10 @@ where
         let mut inner = std::mem::replace(&mut self.inner, clone);
         let engine = self.engine.clone();
         let action = self.action;
+        let cors_passthrough = self.cors_passthrough;
 
         Box::pin(async move {
-            if is_cors_preflight(req.method(), req.headers()) {
+            if cors_passthrough && is_cors_preflight(req.method(), req.headers()) {
                 return inner.call(req).await;
             }
 

@@ -1,20 +1,28 @@
-//! Tower `Layer`/`Service` middleware: access-token validation and scope
-//! enforcement.
+//! Tower `Layer`/`Service` middleware: access-token validation and
+//! authorization enforcement.
 //!
-//! [`ValidatorLayer`] validates the bearer/DPoP/mTLS token and injects the
-//! claims; scope-enforcement layers ([`RequireScopesLayer`]) must nest *inside*
-//! it. Use [`ValidatorLayer::claims_context_for`] (compiler-checked against
-//! the app state's claims type) or [`ValidatorLayer::claims_context`] to
-//! bridge from the validator layer to typed scope middleware.
+//! [`ValidatorLayer`] validates bearer/DPoP/mTLS tokens and injects their
+//! claims. Use [`ValidatorLayer::authenticated`] or
+//! [`ValidatorLayer::require_scopes`], [`ValidatorLayer::require_audience`], or
+//! [`ValidatorLayer::authorize`] for order-safe protection in one layer. The
+//! individual enforcement layers remain available for advanced compositions.
 
-use std::marker::PhantomData;
+use huskarl_resource_server::validator::{
+    AccessTokenValidator, metadata::ProvideValidatorMetadata,
+};
+use tower::Layer;
 
+pub use require_audience::{RequireAudienceLayer, RequireAudienceService};
 pub use require_authenticated::{RequireAuthenticatedLayer, RequireAuthenticatedService};
 pub use require_scopes::{HasScopes, RequireScopesLayer, RequireScopesService};
-pub use validator::{ValidatorLayer, ValidatorService};
+pub use validator::{InvalidBaseUrl, InvalidResourceIdentifier, ValidatorLayer, ValidatorService};
+
+pub use authorize::{AuthorizationError, AuthorizeLayer, AuthorizeService};
 
 use crate::response::ErrorBody;
 
+mod authorize;
+mod require_audience;
 mod require_authenticated;
 mod require_scopes;
 mod validator;
@@ -22,25 +30,180 @@ mod validator;
 #[cfg(test)]
 mod tests;
 
-/// A typed bridge from a [`ValidatorLayer`] to scope-enforcement middleware.
+/// Order-safe composition of token validation and authentication enforcement.
 ///
-/// Returned by [`ValidatorLayer::claims_context_for`] (compiler-checked) and
-/// [`ValidatorLayer::claims_context`]; binds the claims type `C` so scopes are
-/// read from the right type, and carries the layer's configured [`ErrorBody`]
-/// into [`require_scopes`](Self::require_scopes) — so validator failures and
-/// scope failures render their bodies the same way.
-pub struct ClaimsContext<C, E: ErrorBody = ()> {
-    pub(crate) error_body: Option<E>,
-    pub(crate) phantom: PhantomData<C>,
+/// Construct this with [`ValidatorLayer::authenticated`].
+pub struct AuthenticatedLayer<V: ProvideValidatorMetadata, E: ErrorBody = ()> {
+    validator: ValidatorLayer<V, E>,
 }
 
-impl<C, E: ErrorBody> ClaimsContext<C, E> {
-    /// Builds a [`RequireScopesLayer`] requiring every scope in
-    /// `required_scopes` (AND-combined).
-    pub fn require_scopes(&self, required_scopes: Vec<String>) -> RequireScopesLayer<C, E>
-    where
-        C: HasScopes,
-    {
-        RequireScopesLayer::with_options(required_scopes, self.error_body.clone())
+impl<V: ProvideValidatorMetadata, E: ErrorBody> AuthenticatedLayer<V, E> {
+    pub(crate) fn new(validator: ValidatorLayer<V, E>) -> Self {
+        Self { validator }
+    }
+}
+
+impl<V: ProvideValidatorMetadata, E: ErrorBody> Clone for AuthenticatedLayer<V, E> {
+    fn clone(&self) -> Self {
+        Self {
+            validator: self.validator.clone(),
+        }
+    }
+}
+
+impl<V, E, S> Layer<S> for AuthenticatedLayer<V, E>
+where
+    V: AccessTokenValidator + ProvideValidatorMetadata,
+    E: ErrorBody,
+    S: Clone,
+{
+    type Service = ValidatorService<V, E, RequireAuthenticatedService<E, S>>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        self.validator
+            .layer(self.validator.require_authenticated().layer(inner))
+    }
+}
+
+/// Order-safe composition of token validation and audience enforcement.
+///
+/// Construct this with [`ValidatorLayer::require_audience`] or
+/// [`ValidatorLayer::require_any_audience`].
+pub struct AudienceLayer<V: ProvideValidatorMetadata, E: ErrorBody = ()> {
+    validator: ValidatorLayer<V, E>,
+    accepted_audiences: Vec<String>,
+}
+
+impl<V: ProvideValidatorMetadata, E: ErrorBody> AudienceLayer<V, E> {
+    pub(crate) fn new(validator: ValidatorLayer<V, E>, accepted_audiences: Vec<String>) -> Self {
+        Self {
+            validator,
+            accepted_audiences,
+        }
+    }
+}
+
+impl<V: ProvideValidatorMetadata, E: ErrorBody> Clone for AudienceLayer<V, E> {
+    fn clone(&self) -> Self {
+        Self {
+            validator: self.validator.clone(),
+            accepted_audiences: self.accepted_audiences.clone(),
+        }
+    }
+}
+
+impl<V, E, S> Layer<S> for AudienceLayer<V, E>
+where
+    V: AccessTokenValidator + ProvideValidatorMetadata,
+    E: ErrorBody,
+    S: Clone,
+{
+    type Service = ValidatorService<V, E, RequireAudienceService<V::Claims, E, S>>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        self.validator.layer(
+            self.validator
+                .audience_layer(self.accepted_audiences.clone())
+                .layer(inner),
+        )
+    }
+}
+
+/// Order-safe composition of token validation and a custom authorization
+/// check.
+///
+/// Construct this with [`ValidatorLayer::authorize`]. The check receives the
+/// validator's normalized [`ValidatedRequest`](huskarl_resource_server::validator::ValidatedRequest),
+/// including its issuer and audience fields.
+pub struct AuthorizedLayer<V: AccessTokenValidator + ProvideValidatorMetadata, F, E: ErrorBody = ()>
+{
+    validator: ValidatorLayer<V, E>,
+    authorization: AuthorizeLayer<V::Claims, F, E>,
+}
+
+impl<V: AccessTokenValidator + ProvideValidatorMetadata, F, E: ErrorBody> AuthorizedLayer<V, F, E> {
+    pub(crate) fn new(
+        validator: ValidatorLayer<V, E>,
+        authorization: AuthorizeLayer<V::Claims, F, E>,
+    ) -> Self {
+        Self {
+            validator,
+            authorization,
+        }
+    }
+}
+
+impl<V: AccessTokenValidator + ProvideValidatorMetadata, F, E: ErrorBody> Clone
+    for AuthorizedLayer<V, F, E>
+{
+    fn clone(&self) -> Self {
+        Self {
+            validator: self.validator.clone(),
+            authorization: self.authorization.clone(),
+        }
+    }
+}
+
+impl<V, F, E, S> Layer<S> for AuthorizedLayer<V, F, E>
+where
+    V: AccessTokenValidator + ProvideValidatorMetadata,
+    F: Fn(
+            &huskarl_resource_server::validator::ValidatedRequest<V::Claims>,
+        ) -> Result<(), AuthorizationError>
+        + Send
+        + Sync
+        + 'static,
+    E: ErrorBody,
+    S: Clone,
+{
+    type Service = ValidatorService<V, E, AuthorizeService<V::Claims, F, E, S>>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        self.validator.layer(self.authorization.layer(inner))
+    }
+}
+
+/// Order-safe composition of token validation and scope enforcement.
+///
+/// Construct this with [`ValidatorLayer::require_scopes`]. The claims type is
+/// derived from the validator, preventing a mismatched scope layer.
+pub struct ScopedLayer<V: ProvideValidatorMetadata, E: ErrorBody = ()> {
+    validator: ValidatorLayer<V, E>,
+    required_scopes: Vec<String>,
+}
+
+impl<V: ProvideValidatorMetadata, E: ErrorBody> ScopedLayer<V, E> {
+    pub(crate) fn new(validator: ValidatorLayer<V, E>, required_scopes: Vec<String>) -> Self {
+        Self {
+            validator,
+            required_scopes,
+        }
+    }
+}
+
+impl<V: ProvideValidatorMetadata, E: ErrorBody> Clone for ScopedLayer<V, E> {
+    fn clone(&self) -> Self {
+        Self {
+            validator: self.validator.clone(),
+            required_scopes: self.required_scopes.clone(),
+        }
+    }
+}
+
+impl<V, E, S> Layer<S> for ScopedLayer<V, E>
+where
+    V: AccessTokenValidator + ProvideValidatorMetadata,
+    V::Claims: HasScopes,
+    E: ErrorBody,
+    S: Clone,
+{
+    type Service = ValidatorService<V, E, RequireScopesService<V::Claims, E, S>>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        self.validator.layer(
+            self.validator
+                .scope_layer(self.required_scopes.clone())
+                .layer(inner),
+        )
     }
 }

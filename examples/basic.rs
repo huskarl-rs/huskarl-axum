@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use axum::{Json, Router, routing::get};
 use huskarl_axum::{
-    extractors::{HasClaims, TokenFor},
+    extractors::ValidatedToken,
     layers::{HasScopes, ValidatorLayer},
     resource_server::{
         core::{jwk::JwksSource, server_metadata::AuthorizationServerMetadata},
@@ -20,16 +20,9 @@ struct OurClaims {
     user_id: String,
 }
 
-#[derive(Clone)]
-struct AppState;
-
-impl HasClaims for AppState {
-    type Claims = OurClaims;
-}
-
 impl HasScopes for OurClaims {
-    fn scopes(&self) -> Option<Vec<String>> {
-        Some(self.scp.clone())
+    fn has_scope(&self, scope: &str) -> bool {
+        self.scp.iter().any(|granted| granted == scope)
     }
 }
 
@@ -78,32 +71,25 @@ async fn main() {
         .error_body(MyJsonError)
         .build();
 
-    // Scope enforcement for /admin. `claims_context_for::<AppState>()` is
-    // compiler-checked: it only builds if the validator's claims type matches
-    // AppState's `HasClaims` declaration, so the state and the validator
-    // cannot silently disagree about the claims type.
-    let require_admin = validator_layer
-        .claims_context_for::<AppState>()
-        .require_scopes(vec!["admin".to_owned()]);
+    // These are complete, order-safe layers: each validates the token first,
+    // then applies its authentication/scope gate.
+    let require_admin = validator_layer.require_scopes(["admin"]);
+    let require_user = validator_layer.authenticated();
 
     let app = Router::new()
         .route("/admin", get(admin).layer(require_admin))
-        .route("/user", get(user))
-        .layer(validator_layer)
-        .with_state(AppState);
+        .route("/user", get(user).layer(require_user));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
 
-// `TokenFor<AppState>` is `ValidatedToken<OurClaims>` spelled through the
-// state's `HasClaims` declaration, so the claims type is named in one place.
-async fn user(token: TokenFor<AppState>) -> String {
+async fn user(token: ValidatedToken<OurClaims>) -> String {
     format!("User ID: {}", token.claims.user_id)
 }
 
 /// Reached only with a token granting the `admin` scope; otherwise the
 /// `RequireScopesLayer` on this route answers 403 (or 401 without a token).
-async fn admin(token: TokenFor<AppState>) -> String {
+async fn admin(token: ValidatedToken<OurClaims>) -> String {
     format!("Admin: {}", token.claims.user_id)
 }

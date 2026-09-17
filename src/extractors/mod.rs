@@ -1,26 +1,28 @@
 //! Axum extractors for validated access tokens.
 //!
-//! [`ValidatedToken<C>`](ValidatedToken) is extracted in a handler; the claims
-//! type `C` is tied to the router state via [`HasClaims`], so a handler asking
-//! for the wrong claims type fails to compile rather than returning 401 at
-//! runtime.
+//! [`ValidatedToken<C>`](ValidatedToken) is extracted directly in a handler and
+//! works with any router state. Applications that prefer to declare their
+//! claims type on state can use [`TokenFor<S>`](TokenFor) and [`HasClaims`].
 
 use std::convert::Infallible;
 use std::ops::Deref;
 use std::sync::Arc;
 
-use axum_core::extract::{FromRequestParts, OptionalFromRequestParts};
+use axum_core::{
+    extract::{FromRequestParts, OptionalFromRequestParts},
+    response::{IntoResponse, Response},
+};
 use http::{StatusCode, request::Parts};
 use huskarl_resource_server::validator::ValidatedRequest;
 
 use crate::extensions::ValidatorData;
-use crate::response::ChallengeResponse;
+use crate::response::{ChallengeResponse, ErrorBodyRenderer, ErrorDetails};
 
 /// A validated access token and its claims, inserted into the request by the
 /// [`ValidatorLayer`](crate::layers::ValidatorLayer).
 ///
 /// Extract it in a handler as `ValidatedToken<MyClaims>` (the claims type must
-/// match the validator's, enforced via [`HasClaims`]), or as
+/// match the validator's), or as
 /// `Option<ValidatedToken<MyClaims>>` to tolerate unauthenticated requests.
 /// Derefs to the underlying [`ValidatedRequest`].
 ///
@@ -52,12 +54,12 @@ impl<Claims> ValidatedToken<Claims> {
     /// }
     ///
     /// let token = ValidatedToken::new(ValidatedRequest {
-    ///     issuer: None,
-    ///     subject: None,
-    ///     audience: Vec::new(),
+    ///     iss: None,
+    ///     sub: None,
+    ///     aud: Vec::new(),
     ///     jti: None,
-    ///     issued_at: None,
-    ///     expiration: None,
+    ///     iat: None,
+    ///     exp: None,
     ///     cnf: None,
     ///     claims: MyClaims { user_id: "alice".into() },
     ///     introspection_jwt: None,
@@ -88,9 +90,12 @@ impl<Claims> Deref for ValidatedToken<Claims> {
     }
 }
 
-impl<Claims: std::fmt::Debug> std::fmt::Debug for ValidatedToken<Claims> {
+impl<Claims> std::fmt::Debug for ValidatedToken<Claims> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Debug::fmt(&self.0, f)
+        // Claims may contain PII, authorization data, or a raw introspection
+        // JWT. Do not make those values accidentally loggable through this
+        // convenience wrapper.
+        f.debug_struct("ValidatedToken").finish_non_exhaustive()
     }
 }
 
@@ -102,11 +107,12 @@ impl<Claims> Clone for ValidatedToken<Claims> {
 
 /// Names the token claims type for the app's router state.
 ///
-/// Implement this on your `State` type so that handlers can extract
-/// `ValidatedToken<MyClaims>` and the compiler can verify they ask for the
-/// same claims type the [`ValidatorLayer`](crate::layers::ValidatorLayer)
-/// was built with. A handler that asks for a different claims type fails
-/// to compile rather than silently returning 401 at runtime.
+/// Implement this on your `State` type when handlers should use
+/// [`TokenFor<State>`](TokenFor) instead of spelling their claims type as
+/// [`ValidatedToken<MyClaims>`](ValidatedToken). Direct `ValidatedToken`
+/// extraction does not require this trait or any particular router state.
+/// This trait is only a naming convenience; it does not configure or alter the
+/// validator.
 pub trait HasClaims: Send + Sync + 'static {
     /// The token claims type the validator deserializes into.
     type Claims: Send + Sync + 'static;
@@ -123,18 +129,18 @@ impl<C: HasClaims> HasClaims for std::sync::Arc<C> {
 /// `TokenFor<AppState>` is [`ValidatedToken`] of `AppState`'s
 /// [`HasClaims::Claims`], so handlers name the state they already know
 /// instead of repeating the claims type — the claims type stays declared in
-/// exactly one place, and a handler cannot name a different one. Prefer this
-/// form; `ValidatedToken<MyClaims>` remains for naming the claims type
-/// directly. `Option<TokenFor<AppState>>` tolerates unauthenticated requests,
+/// exactly one place, and a handler cannot name a different one through this
+/// alias. `ValidatedToken<MyClaims>` remains the simpler form for stateless
+/// routers. `Option<TokenFor<AppState>>` tolerates unauthenticated requests,
 /// like the underlying extractor.
 pub type TokenFor<S> = ValidatedToken<<S as HasClaims>::Claims>;
 
 impl<S, Claims> FromRequestParts<S> for ValidatedToken<Claims>
 where
-    S: HasClaims<Claims = Claims>,
+    S: Send + Sync,
     Claims: Send + Sync + 'static,
 {
-    type Rejection = ChallengeResponse;
+    type Rejection = ChallengeResponse<Response>;
 
     // `async fn` reads better here than `impl Future` + `std::future::ready`.
     #[allow(clippy::unused_async_trait_impl)]
@@ -148,11 +154,24 @@ where
             |vd| vd.inner.unauthenticated_challenges(None),
         );
 
+        let details = ErrorDetails {
+            status: StatusCode::UNAUTHORIZED,
+            error_code: None,
+            error_description: None,
+            required_scopes: None,
+            challenges: &challenges,
+        };
+        let body = parts
+            .extensions
+            .get::<ErrorBodyRenderer>()
+            .map_or_else(|| ().into_response(), |renderer| renderer.render(&details));
+
         Err(ChallengeResponse {
             status: StatusCode::UNAUTHORIZED,
             challenges,
             dpop_nonce: None,
-            body: (),
+            retry_after: None,
+            body,
         })
     }
 }
@@ -162,7 +181,7 @@ where
 /// `None` otherwise — never rejects.
 impl<S, Claims> OptionalFromRequestParts<S> for ValidatedToken<Claims>
 where
-    S: HasClaims<Claims = Claims>,
+    S: Send + Sync,
     Claims: Send + Sync + 'static,
 {
     type Rejection = Infallible;
@@ -170,5 +189,33 @@ where
     #[allow(clippy::unused_async_trait_impl)]
     async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Option<Self>, Self::Rejection> {
         Ok(parts.extensions.get::<ValidatedToken<Claims>>().cloned())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validated_token_debug_omits_claims_and_introspection_jwt() {
+        #[derive(Debug)]
+        struct SecretClaims(&'static str);
+
+        let token = ValidatedToken::new(ValidatedRequest {
+            iss: Some("https://issuer.example".into()),
+            sub: Some("alice".into()),
+            aud: vec!["api".into()],
+            jti: None,
+            iat: None,
+            exp: None,
+            cnf: None,
+            claims: SecretClaims("top-secret-claim"),
+            introspection_jwt: Some("top-secret-jwt".into()),
+        });
+
+        let debug = format!("{token:?}");
+        assert_eq!(debug, "ValidatedToken { .. }");
+        assert!(!debug.contains(token.claims.0));
+        assert!(!debug.contains("top-secret-jwt"));
     }
 }

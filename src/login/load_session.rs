@@ -24,8 +24,9 @@ use super::layer::{AnonymousBehavior, load_session_and_serve};
 /// without a loader ahead of the gate no request can ever carry a session, so
 /// the gate would otherwise redirect every request to the authorization
 /// server in an endless login loop. Custom middleware that loads sessions
-/// itself and inserts [`LoginSession`](super::LoginSession) directly should
-/// insert this marker too.
+/// itself and inserts a [`LoginSession`](super::LoginSession) created with
+/// [`LoginSession::new`](super::LoginSession::new) should insert this marker
+/// too.
 #[derive(Debug, Clone, Copy)]
 pub struct SessionLoadAttempted;
 
@@ -38,16 +39,27 @@ pub struct SessionLoadAttempted;
 pub struct LoadSessionLayer<SD> {
     engine: Arc<LoginEngine<SD>>,
     persist_failure_policy: Arc<dyn PersistFailurePolicy>,
+    cors_passthrough: bool,
 }
 
 impl<SD> LoadSessionLayer<SD> {
+    #[cfg(test)]
     pub(super) fn new(
         engine: Arc<LoginEngine<SD>>,
         persist_failure_policy: Arc<dyn PersistFailurePolicy>,
     ) -> Self {
+        Self::with_cors_passthrough(engine, persist_failure_policy, true)
+    }
+
+    pub(super) fn with_cors_passthrough(
+        engine: Arc<LoginEngine<SD>>,
+        persist_failure_policy: Arc<dyn PersistFailurePolicy>,
+        cors_passthrough: bool,
+    ) -> Self {
         Self {
             engine,
             persist_failure_policy,
+            cors_passthrough,
         }
     }
 }
@@ -57,6 +69,7 @@ impl<SD> Clone for LoadSessionLayer<SD> {
         Self {
             engine: self.engine.clone(),
             persist_failure_policy: self.persist_failure_policy.clone(),
+            cors_passthrough: self.cors_passthrough,
         }
     }
 }
@@ -69,6 +82,7 @@ impl<SD, S> Layer<S> for LoadSessionLayer<SD> {
             inner,
             engine: self.engine.clone(),
             persist_failure_policy: self.persist_failure_policy.clone(),
+            cors_passthrough: self.cors_passthrough,
         }
     }
 }
@@ -78,6 +92,7 @@ pub struct LoadSessionService<SD, S> {
     inner: S,
     engine: Arc<LoginEngine<SD>>,
     persist_failure_policy: Arc<dyn PersistFailurePolicy>,
+    cors_passthrough: bool,
 }
 
 impl<SD, S: Clone> Clone for LoadSessionService<SD, S> {
@@ -86,6 +101,7 @@ impl<SD, S: Clone> Clone for LoadSessionService<SD, S> {
             inner: self.inner.clone(),
             engine: self.engine.clone(),
             persist_failure_policy: self.persist_failure_policy.clone(),
+            cors_passthrough: self.cors_passthrough,
         }
     }
 }
@@ -114,9 +130,10 @@ where
         let mut inner = std::mem::replace(&mut self.inner, clone);
         let engine = self.engine.clone();
         let persist_failure_policy = self.persist_failure_policy.clone();
+        let cors_passthrough = self.cors_passthrough;
 
         Box::pin(async move {
-            if is_cors_preflight(req.method(), req.headers()) {
+            if cors_passthrough && is_cors_preflight(req.method(), req.headers()) {
                 return inner.call(req).await;
             }
 

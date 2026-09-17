@@ -2,9 +2,8 @@
 //!
 //! [`LoginLayer`] is a convenience that combines login-route handling,
 //! session loading, and unauthenticated-redirect into one layer — equivalent
-//! to stacking [`LoginRoutesLayer`](super::LoginRoutesLayer),
-//! [`LoadSessionLayer`](super::LoadSessionLayer), and
-//! [`RequireSessionLayer`](super::RequireSessionLayer). Use the individual
+//! to stacking [`LoginRoutesLayer`], [`LoadSessionLayer`], and
+//! [`RequireSessionLayer`]. Use the individual
 //! layers when you need finer-grained control (e.g. public routes alongside
 //! protected ones, or custom login handlers).
 
@@ -16,19 +15,20 @@ use axum_core::{
 };
 use http::{Uri, request::Parts};
 use huskarl::{
-    core::crypto::cipher::AeadSealerUnsealer, grant::authorization_code::AuthorizationCodeGrant,
+    core::crypto::seal::AeadSealerUnsealer, grant::authorization_code::AuthorizationCodeGrant,
 };
 use tower::{Layer, Service};
 
 use huskarl_login::{
-    DefaultErrorPage, DefaultPersistFailurePolicy, ErrorPage, LoginConfig, PersistFailurePolicy,
-    SessionDriver,
+    ConfigError, DefaultErrorPage, DefaultPersistFailurePolicy, ErrorPage, LoginConfig,
+    PersistFailurePolicy, SessionDriver,
     engine::{
-        LoadedSession, LoginEngine, LoginResponse, PendingPersist, error_chain, is_cors_preflight,
+        LoadedSession, LoginEngine, LoginResponse, PendingPersist, SetCookies, error_chain,
+        is_cors_preflight,
     },
 };
 
-use super::extractors::LoginSession;
+use super::extractors::{LoginSession, SessionTermination};
 use super::{LoadSessionLayer, LoginRoutesLayer, RequireSessionLayer, UnauthenticatedAction};
 use crate::extensions::RequestUrl;
 
@@ -62,7 +62,7 @@ where
 /// The engine already marks its own redirects and error pages `no-store`. When
 /// `cookies` is empty (the steady-state authenticated request) the response's
 /// own cache headers are left untouched.
-pub(super) fn append_set_cookies(response: &mut Response, cookies: Vec<http::HeaderValue>) {
+pub(super) fn append_set_cookies(response: &mut Response, cookies: SetCookies) {
     if cookies.is_empty() {
         return;
     }
@@ -89,7 +89,7 @@ pub(super) enum Flattened<S> {
     /// `Set-Cookie` clears for stale cookies the engine dropped.
     Anonymous {
         /// Clears for the now-stale session cookies (empty when none).
-        clears: Vec<http::HeaderValue>,
+        clears: SetCookies,
     },
     /// Authenticated. Serve `session`; if `pending` is `Some`, commit it after
     /// the inner handler responds. `set_cookies` must reach the response.
@@ -100,7 +100,7 @@ pub(super) enum Flattened<S> {
         /// whose eager persist failed.
         pending: Option<PendingPersist<S>>,
         /// Re-sealed session cookies from an eager refresh (empty otherwise).
-        set_cookies: Vec<http::HeaderValue>,
+        set_cookies: SetCookies,
     },
     /// The access token expired and its refresh is transiently unavailable:
     /// authentication can be neither confirmed nor refuted right now. Serve a
@@ -113,17 +113,17 @@ pub(super) enum Flattened<S> {
 /// [`Flattened`].
 pub(super) fn flatten_loaded<S>(loaded: LoadedSession<S>) -> Flattened<S> {
     match loaded {
-        LoadedSession::Missing => Flattened::Anonymous { clears: Vec::new() },
-        LoadedSession::Cleared { clears, .. } => Flattened::Anonymous {
-            clears: clears.into_headers(),
+        LoadedSession::Missing => Flattened::Anonymous {
+            clears: SetCookies::default(),
         },
+        LoadedSession::Cleared { clears, .. } => Flattened::Anonymous { clears },
         LoadedSession::Active {
             session,
             set_cookies,
         } => Flattened::Authenticated {
             session: Arc::new(session),
             pending: None,
-            set_cookies: set_cookies.into_headers(),
+            set_cookies,
         },
         // Serve a shared handle to the pending session while keeping the
         // `PendingPersist` itself for the post-response commit; the commit
@@ -131,7 +131,7 @@ pub(super) fn flatten_loaded<S>(loaded: LoadedSession<S>) -> Flattened<S> {
         LoadedSession::ActivePending { pending } => Flattened::Authenticated {
             session: pending.session_arc(),
             pending: Some(pending),
-            set_cookies: Vec::new(),
+            set_cookies: SetCookies::default(),
         },
         LoadedSession::RefreshUnavailable => Flattened::RefreshUnavailable,
     }
@@ -140,22 +140,22 @@ pub(super) fn flatten_loaded<S>(loaded: LoadedSession<S>) -> Flattened<S> {
 /// Returns the URI the engine should treat as the request URL.
 ///
 /// Honours [`RequestUrl`] — the contract for outer middleware sitting behind a
-/// reverse proxy — and falls back to the on-the-wire `parts.uri` when absent.
+/// reverse proxy — then Axum's `OriginalUri` (before router nesting), and
+/// finally `parts.uri` for plain Tower services.
 pub(super) fn effective_uri(parts: &Parts) -> Uri {
-    parts
-        .extensions
-        .get::<RequestUrl>()
-        .map(|r| r.0.clone())
-        .unwrap_or_else(|| parts.uri.clone())
+    parts.extensions.get::<RequestUrl>().map_or_else(
+        || crate::extensions::original_uri(&parts.uri, &parts.extensions).clone(),
+        |r| r.0.clone(),
+    )
 }
 
 /// How [`load_session_and_serve`] answers a request with no session in scope —
 /// the one behavioural difference between the bundled [`LoginLayer`] and a
-/// bare [`LoadSessionLayer`](super::LoadSessionLayer).
+/// bare [`LoadSessionLayer`].
 pub(super) enum AnonymousBehavior {
     /// Run the inner service without a session — [`LoadSessionLayer`]'s
     /// contract (loading never gates; stack a
-    /// [`RequireSessionLayer`](super::RequireSessionLayer) inside to gate).
+    /// [`RequireSessionLayer`] inside to gate).
     PassThrough,
     /// Redirect to the authorization server to begin login — the bundled
     /// [`LoginLayer`]'s "everything protected" default.
@@ -222,18 +222,38 @@ where
         } => (session, pending, set_cookies),
     };
 
-    parts.extensions.insert(LoginSession(session));
+    let termination = SessionTermination::new();
+    parts.extensions.insert(LoginSession(session.clone()));
+    parts.extensions.insert(termination.clone());
 
     let request_headers = parts.headers.clone();
     let mut response = inner.call(Request::from_parts(parts, body)).await?;
     append_set_cookies(&mut response, set_cookies);
+
+    if termination.is_requested() {
+        // A delete wins over the retry of a failed eager refresh persist.
+        if let Some(pending) = pending {
+            pending.abandon();
+        }
+        // Browser clearing and authoritative revocation are independent. The
+        // clears must reach this response even if the backing store is down.
+        let (clears, revocation) = engine
+            .terminate_session(session.as_ref(), &request_headers)
+            .await
+            .into_parts();
+        append_set_cookies(&mut response, clears);
+        if let Err(error) = revocation {
+            log::error!("failed to revoke session: {}", error_chain(&error));
+        }
+        return Ok(response);
+    }
 
     let Some(pending) = pending else {
         return Ok(response);
     };
     match pending.commit(engine, &request_headers).await {
         Ok(cookies) => {
-            append_set_cookies(&mut response, cookies.into_headers());
+            append_set_cookies(&mut response, cookies);
             Ok(response)
         }
         Err(e) => {
@@ -263,12 +283,12 @@ where
 ///     .config(config)
 ///     .grant(grant)
 ///     .session_store(session_store)
-///     .cipher(cipher)
-///     .build();
+///     .build()?;
 /// ```
 pub struct LoginLayer<SD> {
     engine: Arc<LoginEngine<SD>>,
     persist_failure_policy: Arc<dyn PersistFailurePolicy>,
+    cors_passthrough: bool,
 }
 
 #[bon::bon]
@@ -281,7 +301,7 @@ where
     /// The `grant` drives the OAuth flow (PAR, JAR, `DPoP`, PKCE) from its own
     /// configuration and carries its own HTTP client.
     ///
-    /// `cipher` is the cipher for the short-lived login-state cookie (CSRF
+    /// `sealer` seals the short-lived login-state cookie (CSRF
     /// protection during the flow) — a *separate* concern from session
     /// persistence, which the session store handles with its own cipher. It is
     /// **optional**: when omitted it defaults to the session store's cipher,
@@ -294,8 +314,8 @@ where
         config: LoginConfig,
         grant: AuthorizationCodeGrant,
         session_store: SD,
-        #[builder(with = |cipher: impl AeadSealerUnsealer + 'static| Arc::new(cipher) as Arc<dyn AeadSealerUnsealer>)]
-        sealer: Arc<dyn AeadSealerUnsealer>,
+        #[builder(with = |sealer: impl AeadSealerUnsealer + 'static| Arc::new(sealer) as Arc<dyn AeadSealerUnsealer>)]
+        sealer: Option<Arc<dyn AeadSealerUnsealer>>,
         /// Custom error page renderer. Defaults to [`DefaultErrorPage`].
         #[builder(default = Box::new(DefaultErrorPage) as Box<dyn ErrorPage>)]
         error_page: Box<dyn ErrorPage>,
@@ -303,7 +323,17 @@ where
         /// inner handler has run. Defaults to [`DefaultPersistFailurePolicy`].
         #[builder(default = Arc::new(DefaultPersistFailurePolicy) as Arc<dyn PersistFailurePolicy>)]
         persist_failure_policy: Arc<dyn PersistFailurePolicy>,
-    ) -> Self {
+        /// Whether CORS preflight requests (`OPTIONS` with an
+        /// `Access-Control-Request-Method` header) bypass login-route handling,
+        /// session loading, and authentication gating.
+        ///
+        /// Defaults to `true`, because browser preflights carry no credentials
+        /// and should normally be answered by the application or its CORS
+        /// middleware. Set this to `false` to subject preflights to the normal
+        /// login flow.
+        #[builder(default = true)]
+        cors_passthrough: bool,
+    ) -> Result<Self, ConfigError> {
         // An omitted login-state cipher defaults to the store's own inside
         // `LoginEngine::builder()` (the seals are AAD-domain-separated), so the
         // adapter just forwards the optional cipher through.
@@ -311,39 +341,56 @@ where
             .config(config)
             .grant(grant)
             .session_store(session_store)
-            .sealer(sealer)
+            .maybe_sealer(sealer)
             .error_page(error_page)
-            .build();
-        Self {
+            .build()?;
+        Ok(Self {
             engine: Arc::new(engine),
             persist_failure_policy,
-        }
+            cors_passthrough,
+        })
     }
 }
 
 impl<SD> LoginLayer<SD> {
     /// Layer that handles `/callback` and `/logout` only. Pass-through for
     /// every other path.
+    #[must_use]
     pub fn login_routes(&self) -> LoginRoutesLayer<SD> {
-        LoginRoutesLayer::new(self.engine.clone())
+        LoginRoutesLayer::with_cors_passthrough(self.engine.clone(), self.cors_passthrough)
     }
 
     /// Layer that loads and persists the session if a cookie is present.
     /// Never redirects on absence — for that, stack a
     /// [`RequireSessionLayer`] inside.
+    #[must_use]
     pub fn load_session(&self) -> LoadSessionLayer<SD> {
-        LoadSessionLayer::new(self.engine.clone(), self.persist_failure_policy.clone())
+        LoadSessionLayer::with_cors_passthrough(
+            self.engine.clone(),
+            self.persist_failure_policy.clone(),
+            self.cors_passthrough,
+        )
     }
 
     /// Layer that gates inner routes on an authenticated session. Returns
     /// 302 (navigation) or 401 (XHR) when no session is in scope.
+    #[must_use]
     pub fn require_session(&self) -> RequireSessionLayer<SD> {
-        RequireSessionLayer::new(self.engine.clone(), UnauthenticatedAction::LoginOrReject)
+        RequireSessionLayer::with_cors_passthrough(
+            self.engine.clone(),
+            UnauthenticatedAction::LoginOrReject,
+            self.cors_passthrough,
+        )
     }
 
     /// Like [`require_session`](Self::require_session) but configurable.
+    #[must_use]
     pub fn require_session_with(&self, action: UnauthenticatedAction) -> RequireSessionLayer<SD> {
-        RequireSessionLayer::new(self.engine.clone(), action)
+        RequireSessionLayer::with_cors_passthrough(
+            self.engine.clone(),
+            action,
+            self.cors_passthrough,
+        )
     }
 }
 
@@ -352,6 +399,7 @@ impl<SD> Clone for LoginLayer<SD> {
         Self {
             engine: self.engine.clone(),
             persist_failure_policy: self.persist_failure_policy.clone(),
+            cors_passthrough: self.cors_passthrough,
         }
     }
 }
@@ -368,6 +416,7 @@ where
             inner,
             engine: self.engine.clone(),
             persist_failure_policy: self.persist_failure_policy.clone(),
+            cors_passthrough: self.cors_passthrough,
         }
     }
 }
@@ -382,6 +431,7 @@ pub struct LoginService<SD, S> {
     inner: S,
     engine: Arc<LoginEngine<SD>>,
     persist_failure_policy: Arc<dyn PersistFailurePolicy>,
+    cors_passthrough: bool,
 }
 
 impl<SD, S: Clone> Clone for LoginService<SD, S> {
@@ -390,6 +440,7 @@ impl<SD, S: Clone> Clone for LoginService<SD, S> {
             inner: self.inner.clone(),
             engine: self.engine.clone(),
             persist_failure_policy: self.persist_failure_policy.clone(),
+            cors_passthrough: self.cors_passthrough,
         }
     }
 }
@@ -418,9 +469,10 @@ where
         let mut inner = std::mem::replace(&mut self.inner, clone);
         let engine = self.engine.clone();
         let persist_failure_policy = self.persist_failure_policy.clone();
+        let cors_passthrough = self.cors_passthrough;
 
         Box::pin(async move {
-            if is_cors_preflight(req.method(), req.headers()) {
+            if cors_passthrough && is_cors_preflight(req.method(), req.headers()) {
                 return inner.call(req).await;
             }
 

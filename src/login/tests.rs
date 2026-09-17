@@ -27,9 +27,9 @@ use bytes::Bytes;
 use http::{HeaderValue, StatusCode, header};
 use huskarl::{
     core::{
-        Error, ErrorKind,
+        Error, RetryAdvice,
         client_auth::NoAuth,
-        crypto::cipher::AeadSealerUnsealer,
+        crypto::seal::{AeadSealerUnsealer, AeadV1Sealer},
         http::{HttpClient, HttpResponse, Idempotency},
         jwk::OctBytes,
         platform::MaybeSendBoxFuture,
@@ -40,16 +40,16 @@ use huskarl::{
 };
 use huskarl_crypto_native::aead::AesGcmKey;
 use huskarl_login::{
-    CompletedLogin, DefaultPersistFailurePolicy, LoginConfig, LogoutConfig, PersistFailurePolicy,
-    Session, SessionDriver, SessionError, SessionErrorKind, SessionLifetime, SessionState,
-    engine::LoginEngine,
+    CompletedLogin, ConfigError, DefaultPersistFailurePolicy, DriverLoad, LoginConfig,
+    LogoutConfig, PersistFailurePolicy, Session, SessionDriver, SessionError, SessionErrorKind,
+    SessionLifetime, SessionPolicy, SessionState, engine::LoginEngine,
 };
 use tower::{Layer, Service, ServiceExt};
 
 use super::extractors::LoginSession;
 use super::{
     LoadSessionLayer, LoginLayer, LoginRoutesLayer, RequireSessionLayer, SessionLoadAttempted,
-    UnauthenticatedAction,
+    SessionTermination, UnauthenticatedAction,
 };
 
 // ── Mock session ──────────────────────────────────────────────────────────
@@ -81,6 +81,18 @@ fn fresh_session() -> MockSession {
     }
 }
 
+#[test]
+fn login_session_can_be_constructed_for_custom_middleware_and_tests() {
+    let session = LoginSession::new(fresh_session());
+    assert_eq!(session.token_expiry(), session.state().token_expiry);
+
+    let shared = session.clone().into_arc();
+    assert!(Arc::ptr_eq(
+        &shared,
+        &LoginSession::from_arc(shared.clone()).into_arc()
+    ));
+}
+
 /// A session whose access token expired a minute ago and which holds a refresh
 /// token — so `load_session` enters the refresh path. With a working token
 /// endpoint the refresh succeeds; whether the result is `Active` or
@@ -101,14 +113,17 @@ fn refreshable_session() -> MockSession {
 struct MockStore {
     load: Mutex<Option<MockSession>>,
     save_calls: AtomicUsize,
+    revoke_calls: AtomicUsize,
     /// When set, the first `save` (the engine's eager refresh persist) fails,
     /// forcing `load_session` to return `ActivePending`; the second `save`
     /// (the adapter's post-response persist) then succeeds. This is the only
     /// path that yields an owed post-response save now.
     fail_first_save: bool,
+    fail_revoke: bool,
     /// `Set-Cookie` values returned by a successful `save`, used to exercise the
     /// post-persist header path (including the no-store cache fix).
     persist_cookies: Vec<HeaderValue>,
+    clear_cookies: Vec<HeaderValue>,
 }
 
 impl MockStore {
@@ -116,8 +131,11 @@ impl MockStore {
         Self {
             load: Mutex::new(session),
             save_calls: AtomicUsize::new(0),
+            revoke_calls: AtomicUsize::new(0),
             fail_first_save: false,
+            fail_revoke: false,
             persist_cookies: Vec::new(),
+            clear_cookies: Vec::new(),
         }
     }
 
@@ -133,21 +151,40 @@ impl MockStore {
     fn save_count(&self) -> usize {
         self.save_calls.load(Ordering::Relaxed)
     }
+
+    fn with_termination(mut self, fail_revoke: bool) -> Self {
+        self.fail_revoke = fail_revoke;
+        self.clear_cookies = vec![HeaderValue::from_static(
+            "__Host-session=; Secure; HttpOnly; Path=/; Max-Age=0",
+        )];
+        self
+    }
+
+    fn revoke_count(&self) -> usize {
+        self.revoke_calls.load(Ordering::Relaxed)
+    }
 }
 
 impl huskarl_login::session::sealed::Sealed for MockStore {}
 
+#[allow(clippy::unused_async_trait_impl)]
 impl SessionDriver for MockStore {
     type SessionType = MockSession;
     type LoadError = Infallible;
 
-    fn apply_session_policy(
-        &mut self,
-        _secure: bool,
-        _max_lifetime: Option<Duration>,
-        _metrics_name: Option<&str>,
-    ) {
+    fn apply_session_policy(&mut self, _: &SessionPolicy) -> Result<(), ConfigError> {
+        Ok(())
     }
+
+    fn session_sealer(&self) -> Arc<dyn AeadSealerUnsealer> {
+        unimplemented!("tests always configure an explicit login-state sealer")
+    }
+
+    fn clear_session_cookies(&self, _: &http::HeaderMap) -> Vec<HeaderValue> {
+        self.clear_cookies.clone()
+    }
+
+    fn strip_session_credentials(&self, _headers: &mut http::HeaderMap) {}
 
     async fn create(
         &self,
@@ -158,8 +195,13 @@ impl SessionDriver for MockStore {
         unimplemented!("callback exchange is covered by engine tests")
     }
 
-    async fn load(&self, _: &http::HeaderMap) -> Result<Option<MockSession>, Infallible> {
-        Ok(self.load.lock().unwrap().clone())
+    async fn load(&self, _: &http::HeaderMap) -> Result<DriverLoad<MockSession>, Infallible> {
+        Ok(self
+            .load
+            .lock()
+            .unwrap()
+            .clone()
+            .map_or(DriverLoad::Absent, DriverLoad::Valid))
     }
 
     async fn save(
@@ -177,12 +219,16 @@ impl SessionDriver for MockStore {
         Ok(self.persist_cookies.clone())
     }
 
-    async fn delete(
-        &self,
-        _: &MockSession,
-        _: &http::HeaderMap,
-    ) -> Result<Vec<HeaderValue>, SessionError> {
-        Ok(vec![])
+    async fn revoke(&self, _: &MockSession) -> Result<(), SessionError> {
+        self.revoke_calls.fetch_add(1, Ordering::Relaxed);
+        if self.fail_revoke {
+            Err(SessionError::new(
+                SessionErrorKind::Unavailable,
+                "revoke failed",
+            ))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -203,7 +249,7 @@ impl Secret for TestSecret {
 }
 
 async fn test_sealer() -> impl AeadSealerUnsealer {
-    AeadV1Cipher::new(
+    AeadV1Sealer::new(
         AesGcmKey::from_secret(
             TestSecret(SecretBytes::new(vec![0u8; 32])).mapped(OctBytes::new("A256GCM")),
         )
@@ -253,7 +299,7 @@ impl HttpClient for RefreshUnavailableClient {
         _: http::Request<Bytes>,
         _: Idempotency,
     ) -> MaybeSendBoxFuture<'_, Result<HttpResponse, Error>> {
-        Box::pin(async { Err(Error::from(ErrorKind::Transport { retryable: true })) })
+        Box::pin(async { Err(Error::new(RetryAdvice::RETRY, "transport unavailable")) })
     }
 }
 
@@ -281,8 +327,7 @@ async fn test_grant() -> AuthorizationCodeGrant {
 fn config() -> LoginConfig {
     LoginConfig::builder()
         .callback_path("/callback")
-        .scope(bon::vec!["openid"])
-        .base_url("https://app.example.com".parse().unwrap())
+        .scope(bon::vec![])
         .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
         .build()
         .unwrap()
@@ -291,8 +336,7 @@ fn config() -> LoginConfig {
 fn config_with_logout() -> LoginConfig {
     LoginConfig::builder()
         .callback_path("/callback")
-        .scope(bon::vec!["openid"])
-        .base_url("https://app.example.com".parse().unwrap())
+        .scope(bon::vec![])
         .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
         .logout(LogoutConfig::builder().path("/logout").build().unwrap())
         .build()
@@ -318,7 +362,8 @@ async fn engine_with_grant(
             .grant(grant)
             .session_store(store)
             .sealer(test_sealer().await)
-            .build(),
+            .build()
+            .unwrap(),
     )
 }
 
@@ -334,6 +379,7 @@ fn policy() -> Arc<dyn PersistFailurePolicy> {
 #[derive(Clone)]
 struct Inner {
     saw_session: Arc<AtomicBool>,
+    calls: Arc<AtomicUsize>,
     cache_control: Option<&'static str>,
 }
 
@@ -341,17 +387,23 @@ impl Inner {
     fn new() -> Self {
         Self {
             saw_session: Arc::new(AtomicBool::new(false)),
+            calls: Arc::new(AtomicUsize::new(0)),
             cache_control: None,
         }
     }
     fn cacheable() -> Self {
         Self {
             saw_session: Arc::new(AtomicBool::new(false)),
+            calls: Arc::new(AtomicUsize::new(0)),
             cache_control: Some("max-age=600"),
         }
     }
     fn saw_session(&self) -> bool {
         self.saw_session.load(Ordering::Relaxed)
+    }
+
+    fn call_count(&self) -> usize {
+        self.calls.load(Ordering::Relaxed)
     }
 }
 
@@ -369,8 +421,10 @@ impl Service<Request> for Inner {
 
     fn call(&mut self, req: Request) -> Self::Future {
         let saw = self.saw_session.clone();
+        let calls = self.calls.clone();
         let cc = self.cache_control;
         Box::pin(async move {
+            calls.fetch_add(1, Ordering::Relaxed);
             if req
                 .extensions()
                 .get::<LoginSession<MockSession>>()
@@ -402,6 +456,11 @@ fn loaded_req(method: &str, uri: &str, extra: &[(&str, &str)]) -> Request {
     let mut request = req(method, uri, extra);
     request.extensions_mut().insert(SessionLoadAttempted);
     request
+}
+
+async fn terminate_current_session(termination: SessionTermination) -> StatusCode {
+    termination.request();
+    StatusCode::ACCEPTED
 }
 
 // ── LoadSessionLayer ──────────────────────────────────────────────────────
@@ -449,7 +508,7 @@ async fn active_pending_persists_after_handler() {
 
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
-        eng.session_store.save_count(),
+        eng.session_store().save_count(),
         2,
         "eager save failed → owes one post-response persist",
     );
@@ -485,7 +544,7 @@ async fn refresh_unavailable_serves_503_and_retains_session() {
         "the session is retained, so no cookie clears are emitted",
     );
     assert_eq!(
-        eng.session_store.save_count(),
+        eng.session_store().save_count(),
         0,
         "a transient refresh failure persists nothing",
     );
@@ -503,7 +562,7 @@ async fn persisted_session_cookie_forces_no_store() {
 
     let resp = svc.oneshot(req("GET", "/", &[])).await.unwrap();
 
-    assert_eq!(eng.session_store.save_count(), 2);
+    assert_eq!(eng.session_store().save_count(), 2);
     assert!(
         resp.headers().get(header::SET_COOKIE).is_some(),
         "the persist's Set-Cookie must reach the response",
@@ -524,12 +583,74 @@ async fn steady_state_request_preserves_handler_cache_control() {
 
     let resp = svc.oneshot(req("GET", "/", &[])).await.unwrap();
 
-    assert_eq!(eng.session_store.save_count(), 0);
+    assert_eq!(eng.session_store().save_count(), 0);
     assert!(resp.headers().get(header::SET_COOKIE).is_none());
     assert_eq!(
         resp.headers().get(header::CACHE_CONTROL).unwrap(),
         "max-age=600",
         "no session cookie appended → keep the handler's cache header",
+    );
+}
+
+#[tokio::test]
+async fn programmatic_termination_revokes_session_and_clears_browser_cookie() {
+    use axum::{Router, routing::post};
+
+    let store = MockStore::new(Some(fresh_session())).with_termination(false);
+    let engine = engine(store).await;
+    let app = Router::new()
+        .route("/", post(terminate_current_session))
+        .layer(LoadSessionLayer::new(engine.clone(), policy()));
+
+    let response = app.oneshot(req("POST", "/", &[])).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(engine.session_store().revoke_count(), 1);
+    assert_eq!(
+        response.headers()[header::SET_COOKIE],
+        "__Host-session=; Secure; HttpOnly; Path=/; Max-Age=0"
+    );
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+}
+
+#[tokio::test]
+async fn programmatic_termination_preserves_response_and_clears_when_revoke_fails() {
+    use axum::{Router, routing::post};
+
+    let store = MockStore::new(Some(fresh_session())).with_termination(true);
+    let engine = engine(store).await;
+    let app = Router::new()
+        .route("/", post(terminate_current_session))
+        .layer(LoadSessionLayer::new(engine.clone(), policy()));
+
+    let response = app.oneshot(req("POST", "/", &[])).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(engine.session_store().revoke_count(), 1);
+    assert_eq!(
+        response.headers()[header::SET_COOKIE],
+        "__Host-session=; Secure; HttpOnly; Path=/; Max-Age=0"
+    );
+}
+
+#[tokio::test]
+async fn programmatic_termination_abandons_pending_refresh_persist() {
+    use axum::{Router, routing::post};
+
+    let store = MockStore::deferred_save(refreshable_session(), Vec::new()).with_termination(false);
+    let engine = engine(store).await;
+    let app = Router::new()
+        .route("/", post(terminate_current_session))
+        .layer(LoadSessionLayer::new(engine.clone(), policy()));
+
+    let response = app.oneshot(req("POST", "/", &[])).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(engine.session_store().revoke_count(), 1);
+    assert_eq!(
+        engine.session_store().save_count(),
+        1,
+        "the failed eager save must not be retried after termination"
     );
 }
 
@@ -628,6 +749,105 @@ async fn require_session_xhr_returns_401() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
+#[tokio::test]
+async fn require_session_passes_cors_preflight_without_a_loaded_session() {
+    let eng = engine(MockStore::new(None)).await;
+    let inner = Inner::new();
+    let svc =
+        RequireSessionLayer::new(eng, UnauthenticatedAction::LoginOrReject).layer(inner.clone());
+
+    let response = svc
+        .oneshot(req(
+            "OPTIONS",
+            "/api",
+            &[
+                ("origin", "https://client.example"),
+                ("access-control-request-method", "GET"),
+            ],
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(inner.call_count(), 1);
+}
+
+#[tokio::test]
+async fn cors_preflight_passthrough_can_be_disabled() {
+    let login = LoginLayer::builder()
+        .config(config())
+        .grant(test_grant().await)
+        .session_store(MockStore::new(None))
+        .sealer(test_sealer().await)
+        .cors_passthrough(false)
+        .build()
+        .unwrap();
+    let inner = Inner::new();
+    let service = login.layer(inner.clone());
+
+    let response = service
+        .oneshot(req(
+            "OPTIONS",
+            "/api",
+            &[
+                ("origin", "https://client.example"),
+                ("access-control-request-method", "GET"),
+            ],
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(inner.call_count(), 0);
+}
+
+#[tokio::test]
+async fn cors_preflight_setting_propagates_to_component_layers() {
+    let login = LoginLayer::builder()
+        .config(config())
+        .grant(test_grant().await)
+        .session_store(MockStore::new(Some(fresh_session())))
+        .sealer(test_sealer().await)
+        .cors_passthrough(false)
+        .build()
+        .unwrap();
+    let preflight = || {
+        req(
+            "OPTIONS",
+            "/api",
+            &[
+                ("origin", "https://client.example"),
+                ("access-control-request-method", "GET"),
+            ],
+        )
+    };
+
+    let load_inner = Inner::new();
+    let response = login
+        .load_session()
+        .layer(load_inner.clone())
+        .oneshot(preflight())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        load_inner.saw_session(),
+        "disabled passthrough must run session loading"
+    );
+
+    let gate_inner = Inner::new();
+    let mut request = preflight();
+    request.extensions_mut().insert(SessionLoadAttempted);
+    let response = login
+        .require_session_with(UnauthenticatedAction::Reject)
+        .layer(gate_inner.clone())
+        .oneshot(request)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(gate_inner.call_count(), 0);
+}
+
 // ── LoginRoutesLayer ──────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -662,7 +882,11 @@ async fn login_routes_logout_is_post_only() {
     // follow-up request to GET).
     let post = layer
         .layer(Inner::new())
-        .oneshot(req("POST", "/logout", &[]))
+        .oneshot(req(
+            "POST",
+            "/logout",
+            &[("origin", "https://app.example.com")],
+        ))
         .await
         .unwrap();
     assert_eq!(post.status(), StatusCode::SEE_OTHER);
@@ -696,7 +920,8 @@ async fn end_to_end_bundle_protects_router_and_extracts_session() {
         .grant(test_grant().await)
         .session_store(MockStore::new(Some(fresh_session())))
         .sealer(test_sealer().await)
-        .build();
+        .build()
+        .unwrap();
     let app = Router::new().route("/", get(protected)).layer(login);
 
     let resp = app.oneshot(req("GET", "/", &[])).await.unwrap();
@@ -714,7 +939,8 @@ async fn end_to_end_bundle_protects_router_and_extracts_session() {
         .grant(test_grant().await)
         .session_store(MockStore::new(None))
         .sealer(test_sealer().await)
-        .build();
+        .build()
+        .unwrap();
     let app = Router::new().route("/", get(protected)).layer(login);
 
     let resp = app
@@ -726,4 +952,131 @@ async fn end_to_end_bundle_protects_router_and_extracts_session() {
         resp.headers().get(header::LOCATION).is_some(),
         "gated navigation must redirect to the authorization server",
     );
+}
+
+/// Exercise both the bundled and composed login layers inside two nests,
+/// including the actual sealed return URL and browser cookie scope.
+#[tokio::test]
+async fn nested_login_preserves_routes_and_return_url() {
+    use axum::{Router, routing::get};
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use huskarl::core::crypto::seal::AeadUnsealer as _;
+
+    #[derive(serde::Deserialize)]
+    struct LoginState {
+        original_url: String,
+    }
+
+    for bundled in [false, true] {
+        for proxy_prefix in [None, Some("/gateway")] {
+            let cfg = LoginConfig::builder()
+                .callback_path("/app/v1/callback")
+                .scope(vec![])
+                .session_lifetime(SessionLifetime::DelegatedToAuthorizationServer)
+                .maybe_base_path(proxy_prefix.map(str::to_owned))
+                .logout(
+                    LogoutConfig::builder()
+                        .path("/app/v1/logout")
+                        .build()
+                        .unwrap(),
+                )
+                .build()
+                .unwrap();
+            let prefix = proxy_prefix.unwrap_or("");
+            let redirect_uri = format!("https://app.example.com{prefix}/app/v1/callback");
+            let grant = AuthorizationCodeGrant::builder()
+                .client_id("client")
+                .http_client(MockHttpClient)
+                .client_auth(NoAuth)
+                .token_endpoint("https://auth.example.com/token".parse().unwrap())
+                .authorization_endpoint("https://auth.example.com/authorize".parse().unwrap())
+                .redirect_uri(redirect_uri.clone())
+                .build()
+                .await
+                .unwrap();
+            let login = LoginLayer::builder()
+                .config(cfg)
+                .grant(grant)
+                .session_store(MockStore::new(None))
+                .sealer(test_sealer().await)
+                .build()
+                .unwrap();
+            let inner = Router::new()
+                .route("/dashboard", get(|| async { "dashboard" }))
+                .route("/callback", get(|| async { "missed callback" }))
+                .route("/logout", get(|| async { "missed logout" }));
+            let inner = if bundled {
+                inner.layer(login)
+            } else {
+                inner
+                    .layer(login.require_session())
+                    .layer(login.load_session())
+                    .layer(login.login_routes())
+            };
+            let app = Router::new().nest("/app", Router::new().nest("/v1", inner));
+            let response = app
+                .clone()
+                .oneshot(req("GET", "/app/v1/callback", &[]))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let response = app
+                .clone()
+                .oneshot(req("GET", "/app/v1/logout", &[]))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+            assert_eq!(response.headers()[header::ALLOW], "POST");
+
+            let response = app
+                .oneshot(req(
+                    "GET",
+                    "/app/v1/dashboard?tab=one%20two",
+                    &[("sec-fetch-mode", "navigate")],
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FOUND);
+            let location =
+                url::Url::parse(response.headers()[header::LOCATION].to_str().unwrap()).unwrap();
+            let params: std::collections::HashMap<_, _> = location.query_pairs().collect();
+            assert_eq!(params["redirect_uri"], redirect_uri);
+            let state = &params["state"];
+            let cookie = response.headers()[header::SET_COOKIE].to_str().unwrap();
+            assert!(
+                cookie.contains(&format!("Path={prefix}/app/v1/callback;")),
+                "{cookie}"
+            );
+            let (_, value) = cookie.split(';').next().unwrap().split_once('=').unwrap();
+            let bundle = URL_SAFE_NO_PAD.decode(value).unwrap();
+            let plaintext = test_sealer()
+                .await
+                .unseal(&bundle, format!("login_state:{state}").as_bytes(), None)
+                .await
+                .unwrap();
+            let saved: LoginState = ciborium::from_reader(plaintext.as_slice()).unwrap();
+            assert_eq!(
+                saved.original_url,
+                format!("https://app.example.com{prefix}/app/v1/dashboard?tab=one%20two")
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn nested_login_honours_request_url_override() {
+    use crate::extensions::RequestUrl;
+    use axum::{Router, routing::get};
+
+    let eng = engine(MockStore::new(None)).await;
+    let inner = Router::new()
+        .route("/callback", get(|| async { "missed callback" }))
+        .layer(LoginRoutesLayer::new(eng));
+    let app = Router::new().nest("/app", inner);
+    let mut request = req("GET", "/app/callback", &[]);
+    request.extensions_mut().insert(RequestUrl(
+        "https://app.example.com/callback".parse().unwrap(),
+    ));
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }

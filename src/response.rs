@@ -4,8 +4,14 @@
 //! optional `DPoP-Nonce`); [`ErrorBody`] lets you attach a custom body to those
 //! responses, built from the structured failure details in [`ErrorDetails`].
 
-use axum_core::response::IntoResponse;
-use http::{HeaderValue, StatusCode, header::WWW_AUTHENTICATE};
+use std::sync::Arc;
+
+use axum_core::response::{IntoResponse, Response};
+use http::{
+    HeaderValue, StatusCode,
+    header::{CACHE_CONTROL, RETRY_AFTER, WWW_AUTHENTICATE},
+};
+use huskarl_resource_server::core::platform::Duration;
 
 pub use huskarl_resource_server::error::TokenErrorCode;
 
@@ -45,8 +51,9 @@ pub struct ErrorDetails<'a> {
 /// Builds the response body for a `WWW-Authenticate` challenge.
 ///
 /// Implement this trait to customize the body of the challenge responses
-/// returned by the validator and scope-enforcement middleware. The default
-/// implementation (`()`) returns an empty body.
+/// returned by the validator, scope/authentication middleware, and the
+/// [`ValidatedToken`](crate::extractors::ValidatedToken) extractor. The
+/// default implementation (`()`) returns an empty body.
 pub trait ErrorBody: Clone + Send + Sync + 'static {
     /// The response body type produced for a challenge.
     type Body: IntoResponse;
@@ -59,10 +66,36 @@ impl ErrorBody for () {
     fn error_body(&self, _: &ErrorDetails<'_>) -> Self::Body {}
 }
 
-/// An RFC 6750 challenge response with `WWW-Authenticate` headers.
+/// Type-erased error-body renderer carried in request extensions so extractor
+/// rejections use the same body configuration as their validator layer.
+#[derive(Clone)]
+pub(crate) struct ErrorBodyRenderer(Arc<dyn RenderErrorBody>);
+
+impl ErrorBodyRenderer {
+    pub(crate) fn new<E: ErrorBody>(error_body: E) -> Self {
+        Self(Arc::new(error_body))
+    }
+
+    pub(crate) fn render(&self, details: &ErrorDetails<'_>) -> Response {
+        self.0.render(details)
+    }
+}
+
+trait RenderErrorBody: Send + Sync {
+    fn render(&self, details: &ErrorDetails<'_>) -> Response;
+}
+
+impl<E: ErrorBody> RenderErrorBody for E {
+    fn render(&self, details: &ErrorDetails<'_>) -> Response {
+        self.error_body(details).into_response()
+    }
+}
+
+/// An RFC 6750 challenge response with authentication-related headers.
 ///
 /// The body type `B` defaults to `()` (empty body). Pass any [`IntoResponse`] type
 /// to include a response body — for example, `axum::Json<T>` for a JSON error payload.
+#[non_exhaustive]
 pub struct ChallengeResponse<B = ()> {
     /// The HTTP status (e.g. `401` or `403`).
     pub status: StatusCode,
@@ -70,6 +103,11 @@ pub struct ChallengeResponse<B = ()> {
     pub challenges: Vec<String>,
     /// A `DPoP-Nonce` to return, if the server is issuing one (RFC 9449 §8).
     pub dpop_nonce: Option<String>,
+    /// How long the client should wait before retrying a server-side failure.
+    ///
+    /// Rendered as RFC 9110 delta-seconds, rounding a non-zero fractional
+    /// second up so an active cooldown is never advertised as zero.
+    pub retry_after: Option<Duration>,
     /// The response body.
     pub body: B,
 }
@@ -88,6 +126,19 @@ impl<B: IntoResponse> IntoResponse for ChallengeResponse<B> {
         {
             response.headers_mut().insert(DPOP_NONCE.clone(), value);
         }
+        if let Some(after) = self.retry_after {
+            let seconds = after
+                .as_secs()
+                .saturating_add(u64::from(after.subsec_nanos() > 0));
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from(seconds));
+        }
+        // Authentication failures and their application-defined bodies must
+        // not be stored by shared or private caches.
+        response
+            .headers_mut()
+            .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
         response
     }
 }

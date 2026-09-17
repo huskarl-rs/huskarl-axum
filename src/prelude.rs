@@ -11,8 +11,8 @@
 //! [`ErrorDetails`], the input to `ErrorBody`.
 
 pub use crate::extractors::{HasClaims, TokenFor, ValidatedToken};
-pub use crate::layers::HasScopes;
+pub use crate::layers::{AuthorizationError, HasScopes};
 pub use crate::response::{ErrorBody, ErrorDetails};
 
 #[cfg(feature = "login")]
-pub use crate::login::{HasSession, LoginSession, SessionFor};
+pub use crate::login::{HasSession, LoginSession, SessionFor, SessionTermination};

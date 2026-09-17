@@ -1,17 +1,164 @@
-use std::{marker::PhantomData, pin::Pin, sync::Arc};
+use std::{collections::BTreeSet, pin::Pin, sync::Arc};
 
 use axum_core::{extract::Request, response::IntoResponse, response::Response};
 use http::Uri;
 use huskarl_resource_server::{
+    core::resource_metadata::well_known_url,
     error::{ToRfc6750Error as _, TokenErrorCode, TokenValidationError},
     validator::{AccessTokenValidator, metadata::ProvideValidatorMetadata},
 };
 use tower::{Layer, Service};
 
 use crate::extensions::{ClientCertDer, HasValidToken, RequestUrl, ValidatorData};
-use crate::extractors::{HasClaims, ValidatedToken};
-use crate::layers::ClaimsContext;
-use crate::response::{ChallengeResponse, DPOP_NONCE, ErrorBody, ErrorDetails};
+use crate::extractors::ValidatedToken;
+use crate::layers::{
+    AudienceLayer, AuthenticatedLayer, AuthorizationError, AuthorizeLayer, AuthorizedLayer,
+    HasScopes, RequireAudienceLayer, RequireScopesLayer, ScopedLayer,
+};
+use crate::resource_metadata::{AudienceBinding, ResourceMetadataError, ResourceMetadataService};
+use crate::response::{ChallengeResponse, DPOP_NONCE, ErrorBody, ErrorBodyRenderer, ErrorDetails};
+
+/// Error returned by the `base_url` setter on
+/// [`ValidatorLayer::builder`] when it receives an invalid externally-visible
+/// resource-server base URL.
+///
+/// The URL must be an absolute `http` or `https` URI with no query. Its path is
+/// the externally visible prefix prepended to incoming request paths and
+/// protected-resource subpaths.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct InvalidBaseUrl {
+    value: String,
+    reason: &'static str,
+    source: Option<http::uri::InvalidUri>,
+}
+
+/// Error returned when [`ValidatorLayer::with_protected_resource`] derives an
+/// invalid RFC 9728 protected-resource identifier.
+///
+/// Resource identifiers are preserved byte-for-byte for RFC 9728's identity
+/// check. They must be absolute `https` URLs and may include a path or query,
+/// but not a fragment.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct InvalidResourceIdentifier {
+    value: String,
+    reason: &'static str,
+    source: Option<http::uri::InvalidUri>,
+}
+
+impl std::fmt::Display for InvalidResourceIdentifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "invalid protected-resource identifier {:?}: {}",
+            self.value, self.reason
+        )
+    }
+}
+
+impl std::error::Error for InvalidResourceIdentifier {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
+    }
+}
+
+impl std::fmt::Display for InvalidBaseUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid base URL {:?}: {}", self.value, self.reason)
+    }
+}
+
+impl std::error::Error for InvalidBaseUrl {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
+    }
+}
+
+fn parse_base_url(value: &str) -> Result<Uri, InvalidBaseUrl> {
+    let uri = value.parse::<Uri>().map_err(|source| InvalidBaseUrl {
+        value: value.to_owned(),
+        reason: "not a valid URI",
+        source: Some(source),
+    })?;
+
+    if !matches!(uri.scheme_str(), Some("http" | "https")) || uri.authority().is_none() {
+        return Err(InvalidBaseUrl {
+            value: value.to_owned(),
+            reason: "expected an absolute http(s) URL with an authority",
+            source: None,
+        });
+    }
+    if uri.query().is_some() {
+        return Err(InvalidBaseUrl {
+            value: value.to_owned(),
+            reason: "queries are not allowed",
+            source: None,
+        });
+    }
+
+    Ok(uri)
+}
+
+fn join_base_url(base: &Uri, path_and_query: &http::uri::PathAndQuery) -> Option<Uri> {
+    let base_path = base.path().trim_end_matches('/');
+    let suffix = path_and_query.path();
+    let path = if suffix.starts_with('/') {
+        format!("{base_path}{suffix}")
+    } else {
+        format!("{base_path}/{suffix}")
+    };
+    let joined = match path_and_query.query() {
+        Some(query) => format!("{path}?{query}"),
+        None => path,
+    };
+
+    let path_and_query = joined.parse().ok()?;
+    let mut parts = base.clone().into_parts();
+    parts.path_and_query = Some(path_and_query);
+    Uri::from_parts(parts).ok()
+}
+
+fn parse_resource_identifier(value: &str) -> Result<String, InvalidResourceIdentifier> {
+    if value.contains('#') {
+        return Err(InvalidResourceIdentifier {
+            value: value.to_owned(),
+            reason: "fragments are not allowed",
+            source: None,
+        });
+    }
+
+    let uri = value
+        .parse::<Uri>()
+        .map_err(|source| InvalidResourceIdentifier {
+            value: value.to_owned(),
+            reason: "not a valid URI",
+            source: Some(source),
+        })?;
+
+    if uri.scheme_str() != Some("https") || uri.authority().is_none() {
+        return Err(InvalidResourceIdentifier {
+            value: value.to_owned(),
+            reason: "expected an absolute https URL with an authority",
+            source: None,
+        });
+    }
+    if well_known_url(value).is_err() {
+        return Err(InvalidResourceIdentifier {
+            value: value.to_owned(),
+            reason: "cannot derive an RFC 9728 metadata URL",
+            source: None,
+        });
+    }
+
+    // Keep the caller's exact spelling: RFC 9728 §3.3 compares this value
+    // byte-for-byte with the document's `resource` member.
+    Ok(value.to_owned())
+}
 
 /// Tower [`Layer`] that validates the access token on each request
 /// and injects the claims for extractors.
@@ -20,11 +167,20 @@ use crate::response::{ChallengeResponse, DPOP_NONCE, ErrorBody, ErrorDetails};
 /// inserts a [`ValidatedToken`] (plus DPoP/metadata extensions) on success, and
 /// returns an RFC 6750 `WWW-Authenticate` challenge on failure. Build one with
 /// [`builder`](Self::builder); it must be the outermost auth layer, with any
-/// [`RequireScopesLayer`](super::RequireScopesLayer) nested inside. Call
-/// [`claims_context`](Self::claims_context) to attach scope middleware.
+/// [`RequireScopesLayer`] nested inside. Prefer the
+/// order-safe [`authenticated`](Self::authenticated) and
+/// [`require_scopes`](Self::require_scopes) composite layers for protected
+/// routes.
+///
+/// When no token is present, this layer by itself passes the request through so
+/// handlers can use `Option<ValidatedToken<_>>`. Use one of the composite
+/// layers whenever authentication is required.
 pub struct ValidatorLayer<V: ProvideValidatorMetadata, E: ErrorBody = ()> {
     config: Arc<ValidatorConfig<V>>,
+    validator_data: ValidatorData,
     error_body: Option<E>,
+    extractor_error_body: Option<ErrorBodyRenderer>,
+    resource_audiences: Option<Arc<Vec<String>>>,
 }
 
 #[bon::bon]
@@ -38,42 +194,54 @@ impl<V: ProvideValidatorMetadata, E: ErrorBody> ValidatorLayer<V, E> {
     /// `validator` performs the actual token validation; a custom `error_body`
     /// attaches a body to challenge responses.
     ///
-    /// `base_url` (optional) is this resource server's own externally-visible base
-    /// URL — scheme + authority, e.g. `https://api.example.com`. It is used for two
-    /// things:
+    /// `base_url` is this integration's externally visible mount URL, e.g.
+    /// `https://api.example.com/gateway`. Its path is the public prefix prepended
+    /// to request paths and protected-resource subpaths. Request paths include
+    /// all `Router::nest` prefixes, using Axum's `OriginalUri`. Only include
+    /// a prefix in `base_url` when a reverse proxy removes it before the request
+    /// reaches Axum; do not repeat an Axum nesting prefix here. It is required for
+    /// **`DPoP` `htu` binding** and by [`with_protected_resource`](Self::with_protected_resource),
+    /// but may be omitted by a bearer-only integration without local protected
+    /// resource metadata.
     ///
-    /// 1. the resource URL advertised in `WWW-Authenticate` / RFC 9728 metadata, and
-    /// 2. **DPoP `htu` binding** — the layer reconstructs the request URL as
-    ///    `base_url` + the request path and passes it to the validator, which checks
-    ///    it against the proof's `htu` claim.
+    /// The generated `base_url` setter validates the origin immediately and
+    /// returns `Result<_, InvalidBaseUrl>`; use
+    /// `.base_url("https://api.example.com/gateway")?`.
     ///
     /// # Security
     ///
-    /// For (2), the origin used for `htu` must be one the client cannot spoof:
-    /// a static `base_url` you configure, or — when one server fronts several
-    /// origins — a [`RequestUrl`] you inject from forwarded headers your
-    /// deployment makes trustworthy. Never derive it from the raw `Host` header
-    /// or an untrusted forwarded header: a request could set it to match a
-    /// captured proof's `htu` and pass the check. With neither configured the
-    /// request URL is origin-form and the validator fails closed with an
-    /// integration error rather than checking `htu`. See the huskarl-resource-server
-    /// DPoP how-to guide for reconstructing the origin behind a proxy.
+    /// The origin used for `htu` must be one the client cannot spoof:
+    /// a static `base_url` you configure, or a [`RequestUrl`] injected by trusted
+    /// middleware when the proxy rewrite cannot be represented by one prefix.
+    /// Never derive either from the raw `Host` header or an untrusted forwarded
+    /// header: a request could set it to match a captured proof's `htu` and pass
+    /// the check. With neither configured the request URL is origin-form and the
+    /// validator fails closed with an integration error rather than checking
+    /// `htu`. See the huskarl-resource-server `DPoP` how-to guide for
+    /// reconstructing the public URL behind a proxy.
     pub fn new(
         validator: V,
-        #[builder(into)] base_url: Option<String>,
+        #[builder(with = |base_url: impl AsRef<str>| -> Result<_, InvalidBaseUrl> {
+            parse_base_url(base_url.as_ref())
+        })]
+        base_url: Option<Uri>,
         #[builder(setters(name = error_body_internal, vis = ""))] error_body: Option<E>,
     ) -> Self {
-        let validator_metadata = validator.validator_metadata(base_url.as_deref());
+        let validator_metadata = validator.validator_metadata(None);
+
+        let extractor_error_body = error_body.clone().map(ErrorBodyRenderer::new);
 
         Self {
             config: Arc::new(ValidatorConfig {
                 validator,
                 base_url,
-                validator_data: ValidatorData {
-                    inner: Arc::new(validator_metadata),
-                },
             }),
+            validator_data: ValidatorData {
+                inner: Arc::new(validator_metadata),
+            },
             error_body,
+            extractor_error_body,
+            resource_audiences: None,
         }
     }
 }
@@ -105,61 +273,285 @@ impl<V: ProvideValidatorMetadata, E: ErrorBody, S: State> ValidatorLayerBuilder<
 }
 
 impl<V: ProvideValidatorMetadata, E: ErrorBody> ValidatorLayer<V, E> {
-    /// Binds the token claims type `C` and returns a
-    /// [`ClaimsContext`] for attaching scope-enforcement
-    /// middleware, carrying this layer's configured error body.
-    pub fn claims_context<C>(&self) -> ClaimsContext<C, E> {
-        ClaimsContext {
-            error_body: self.error_body.clone(),
-            phantom: PhantomData,
-        }
-    }
-
-    /// Like [`claims_context`](Self::claims_context), but compiler-checked
-    /// against the app state: binds the claims type through `S`'s
-    /// [`HasClaims`] declaration and requires it to match the wrapped
-    /// validator's claims type. Prefer this form — a mismatch between the
-    /// state's declared claims type and the validator's is the one wiring
-    /// error `claims_context` cannot catch, and it otherwise surfaces only at
-    /// runtime, as every extraction failing with 401.
+    /// Configures an audience-bound RFC 9728 protected resource.
     ///
-    /// ```compile_fail
-    /// use huskarl_axum::extractors::HasClaims;
-    /// use huskarl_axum::layers::ValidatorLayer;
-    /// use huskarl_axum::resource_server::validator::custom::CustomValidator;
+    /// Returns this validator layer, updated so every presented token must
+    /// match the resource's audience binding and all `WWW-Authenticate`
+    /// challenges advertise its endpoint, together with the Tower service that
+    /// serves the document. Mount the service at
+    /// [`ResourceMetadataService::path`] with Axum's `Router::route_service`.
     ///
-    /// struct StateClaims;
-    /// struct ValidatorClaims;
+    /// One configured layer represents one protected resource. Its audience
+    /// and challenge metadata apply to every request routed through that
+    /// layer; Axum's router determines the protected path set. Those routes are
+    /// endpoints of one logical resource and share one document; the library
+    /// does not generate a document for every descendant URL. To host multiple
+    /// MCP servers, configure a separate layer and metadata service for each
+    /// server and mount each layer on that server's router or route subtree.
     ///
-    /// struct AppState;
-    /// impl HasClaims for AppState {
-    ///     type Claims = StateClaims;
-    /// }
+    /// The document is built from the validator's capabilities and the
+    /// protected-resource identifier derived from `base_url` and the supplied
+    /// subpath. Supplied scopes are sorted and deduplicated. The endpoint and
+    /// challenge URL are derived together, so they cannot drift.
     ///
-    /// // The state declares StateClaims but the validator produces
-    /// // ValidatorClaims — this must not compile.
-    /// fn mismatch(layer: &ValidatorLayer<CustomValidator<ValidatorClaims>>) {
-    ///     let _ = layer.claims_context_for::<AppState>();
-    /// }
-    /// ```
-    pub fn claims_context_for<S>(&self) -> ClaimsContext<S::Claims, E>
+    /// `resource_path` is relative to this integration's configured `base_url`
+    /// and must begin with `/`. The base URL's path is the public rewritten
+    /// prefix. For example, base URL `https://api.example.com/gateway` plus
+    /// resource path `/mcp/inventory` identifies
+    /// `https://api.example.com/gateway/mcp/inventory`. A query on the resource
+    /// path is preserved.
+    ///
+    /// Behind a path-rewriting proxy, an outer trusted middleware may provide
+    /// [`RequestUrl`] with the complete public request URL used for `DPoP`.
+    /// Route the canonical public metadata URL to the returned service through
+    /// the same deployment's router or front-proxy mapping.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a missing base URL, an already-bound layer, invalid resource
+    /// subpaths or identifiers, empty mapped audience sets, and validators that
+    /// explicitly advertise a different metadata URL. URL derivation and JSON
+    /// encoding failures are also reported.
+    pub fn with_protected_resource<I, T>(
+        mut self,
+        resource_path: impl AsRef<str>,
+        audience_binding: AudienceBinding,
+        scopes_supported: I,
+    ) -> Result<(Self, ResourceMetadataService), ResourceMetadataError>
     where
-        S: HasClaims,
-        V: AccessTokenValidator<Claims = S::Claims>,
+        I: IntoIterator<Item = T>,
+        T: Into<String>,
     {
-        ClaimsContext {
-            error_body: self.error_body.clone(),
-            phantom: PhantomData,
+        if self.resource_audiences.is_some() {
+            return Err(ResourceMetadataError::ProtectedResourceAlreadyConfigured);
         }
+        let base_url = self
+            .config
+            .base_url
+            .as_ref()
+            .ok_or(ResourceMetadataError::MissingBaseUrl)?;
+        let resource_path = resource_path.as_ref();
+        if !resource_path.starts_with('/') || resource_path.contains('#') {
+            return Err(ResourceMetadataError::InvalidResourcePath {
+                path: resource_path.to_owned(),
+            });
+        }
+        let relative = resource_path.parse::<Uri>().map_err(|_| {
+            ResourceMetadataError::InvalidResourcePath {
+                path: resource_path.to_owned(),
+            }
+        })?;
+        if relative.scheme().is_some() || relative.authority().is_some() {
+            return Err(ResourceMetadataError::InvalidResourcePath {
+                path: resource_path.to_owned(),
+            });
+        }
+        let Some(path_and_query) = relative.path_and_query() else {
+            return Err(ResourceMetadataError::InvalidResourcePath {
+                path: resource_path.to_owned(),
+            });
+        };
+        let resource_uri = join_base_url(base_url, path_and_query).ok_or_else(|| {
+            ResourceMetadataError::InvalidResourcePath {
+                path: resource_path.to_owned(),
+            }
+        })?;
+        let resource = parse_resource_identifier(&resource_uri.to_string())
+            .map_err(ResourceMetadataError::InvalidResourceIdentifier)?;
+        let audiences = audience_binding.into_audiences(&resource);
+        if audiences.is_empty() {
+            return Err(ResourceMetadataError::EmptyAudiences);
+        }
+        let metadata_url =
+            well_known_url(&resource).map_err(ResourceMetadataError::WellKnownUrl)?;
+        let derived = metadata_url.to_string();
+
+        let mut metadata = self.config.validator.validator_metadata(Some(&resource));
+        if let Some(configured) = metadata.resource_metadata.as_ref()
+            && configured != &derived
+        {
+            return Err(ResourceMetadataError::MetadataUrlMismatch {
+                configured: configured.clone(),
+                derived,
+            });
+        }
+
+        // `resource` is the deployment's source of truth. A custom metadata
+        // provider may omit `resource`; fill it here so the emitted document
+        // and the endpoint derived above always describe the same resource.
+        metadata.resource = Some(resource);
+        metadata.resource_metadata = Some(derived);
+
+        let Some(mut document) = metadata.to_resource_metadata() else {
+            return Err(ResourceMetadataError::DocumentUnavailable);
+        };
+        let scopes = scopes_supported
+            .into_iter()
+            .map(Into::into)
+            .collect::<BTreeSet<_>>();
+        if !scopes.is_empty() {
+            document.scopes_supported = Some(scopes.into_iter().collect());
+        }
+        let body = serde_json::to_vec(&document).map_err(ResourceMetadataError::Serialization)?;
+        let endpoint_uri = metadata_url.as_uri().clone();
+
+        self.validator_data = ValidatorData {
+            inner: Arc::new(metadata),
+        };
+        self.resource_audiences = Some(Arc::new(audiences));
+        Ok((
+            self,
+            ResourceMetadataService::new(resource_uri, endpoint_uri, body),
+        ))
     }
 
-    /// Returns a [`RequireAuthenticatedLayer`](super::RequireAuthenticatedLayer)
+    /// Returns one order-safe layer that validates and requires a token.
+    ///
+    /// Unlike manually stacking [`ValidatorLayer`] and
+    /// [`RequireAuthenticatedLayer`](super::RequireAuthenticatedLayer), this
+    /// composite cannot be put in the wrong order.
+    #[must_use]
+    pub fn authenticated(&self) -> AuthenticatedLayer<V, E> {
+        AuthenticatedLayer::new(self.clone())
+    }
+
+    /// Returns an order-safe layer requiring one exact audience value.
+    ///
+    /// Audience enforcement runs against the normalized `aud` values in
+    /// [`ValidatedToken`], so this works the same way for JWT, opaque, and
+    /// multi-source validators. A mismatch returns `401 invalid_token`.
+    #[must_use]
+    pub fn require_audience(&self, accepted_audience: impl Into<String>) -> AudienceLayer<V, E>
+    where
+        V: AccessTokenValidator,
+    {
+        AudienceLayer::new(self.clone(), vec![accepted_audience.into()])
+    }
+
+    /// Returns an order-safe layer accepting a token that contains at least
+    /// one of the supplied audience values (OR-combined).
+    #[must_use]
+    pub fn require_any_audience<I, T>(&self, accepted_audiences: I) -> AudienceLayer<V, E>
+    where
+        V: AccessTokenValidator,
+        I: IntoIterator<Item = T>,
+        T: Into<String>,
+    {
+        AudienceLayer::new(
+            self.clone(),
+            accepted_audiences.into_iter().map(Into::into).collect(),
+        )
+    }
+
+    /// Builds only the inner audience-enforcement layer.
+    ///
+    /// It must be placed inside this validator layer. Most applications should
+    /// prefer [`require_audience`](Self::require_audience) or
+    /// [`require_any_audience`](Self::require_any_audience), which guarantee
+    /// the ordering.
+    #[must_use]
+    pub fn audience_layer<I, T>(&self, accepted_audiences: I) -> RequireAudienceLayer<V::Claims, E>
+    where
+        V: AccessTokenValidator,
+        I: IntoIterator<Item = T>,
+        T: Into<String>,
+    {
+        RequireAudienceLayer::with_options(
+            accepted_audiences.into_iter().map(Into::into).collect(),
+            self.error_body.clone(),
+        )
+    }
+
+    /// Returns an order-safe layer applying a custom authorization check.
+    ///
+    /// The check receives the validator-independent normalized request,
+    /// including `iss`, `aud`, and the source's claims. This permits
+    /// source-aware policy while remaining compatible with multi-source
+    /// validators. Return [`AuthorizationError::Forbidden`] for a `403` or
+    /// [`AuthorizationError::InvalidToken`] for a `401`.
+    #[must_use]
+    pub fn authorize<F>(&self, check: F) -> AuthorizedLayer<V, F, E>
+    where
+        V: AccessTokenValidator,
+        F: Fn(
+                &huskarl_resource_server::validator::ValidatedRequest<V::Claims>,
+            ) -> Result<(), AuthorizationError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        AuthorizedLayer::new(
+            self.clone(),
+            AuthorizeLayer::with_options(check, self.error_body.clone()),
+        )
+    }
+
+    /// Builds only the inner custom-authorization layer.
+    ///
+    /// It must be placed inside this validator layer; prefer
+    /// [`authorize`](Self::authorize) for an order-safe composition.
+    #[must_use]
+    pub fn authorization_layer<F>(&self, check: F) -> AuthorizeLayer<V::Claims, F, E>
+    where
+        V: AccessTokenValidator,
+        F: Fn(
+                &huskarl_resource_server::validator::ValidatedRequest<V::Claims>,
+            ) -> Result<(), AuthorizationError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        AuthorizeLayer::with_options(check, self.error_body.clone())
+    }
+
+    /// Returns one order-safe layer that validates a token and requires every
+    /// supplied scope (AND-combined).
+    ///
+    /// The claims type is derived from the validator itself, so scope
+    /// middleware cannot accidentally inspect a different claims type.
+    #[must_use]
+    pub fn require_scopes<I, T>(&self, required_scopes: I) -> ScopedLayer<V, E>
+    where
+        V: AccessTokenValidator,
+        V::Claims: HasScopes,
+        I: IntoIterator<Item = T>,
+        T: Into<String>,
+    {
+        ScopedLayer::new(
+            self.clone(),
+            required_scopes.into_iter().map(Into::into).collect(),
+        )
+    }
+
+    /// Builds only the inner scope-enforcement layer.
+    ///
+    /// This is useful for advanced nested middleware compositions. It must be
+    /// placed inside this validator layer; most applications should prefer
+    /// [`require_scopes`](Self::require_scopes), which guarantees the order.
+    #[must_use]
+    pub fn scope_layer<I, T>(&self, required_scopes: I) -> RequireScopesLayer<V::Claims, E>
+    where
+        V: AccessTokenValidator,
+        V::Claims: HasScopes,
+        I: IntoIterator<Item = T>,
+        T: Into<String>,
+    {
+        RequireScopesLayer::with_options(
+            required_scopes.into_iter().map(Into::into).collect(),
+            self.error_body.clone(),
+        )
+    }
+
+    /// Returns the low-level
+    /// [`RequireAuthenticatedLayer`](super::RequireAuthenticatedLayer)
     /// carrying this layer's error body.
     ///
     /// Stack it inside this [`ValidatorLayer`] to reject any request that did not
     /// present a valid token with `401 Unauthorized`, rather than letting an
     /// unauthenticated request reach the handler and relying on a
-    /// [`ValidatedToken`](crate::extractors::ValidatedToken) extractor to gate it.
+    /// [`ValidatedToken`] extractor to gate it. Prefer
+    /// [`authenticated`](Self::authenticated) unless manually composing nested
+    /// auth middleware.
     #[must_use]
     pub fn require_authenticated(&self) -> super::RequireAuthenticatedLayer<E> {
         super::RequireAuthenticatedLayer::with_options(self.error_body.clone())
@@ -170,17 +562,19 @@ impl<V: ProvideValidatorMetadata, E: ErrorBody> Clone for ValidatorLayer<V, E> {
     fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),
+            validator_data: self.validator_data.clone(),
             error_body: self.error_body.clone(),
+            extractor_error_body: self.extractor_error_body.clone(),
+            resource_audiences: self.resource_audiences.clone(),
         }
     }
 }
 
 /// Shared, immutable validator state, held in an `Arc` by the layer and service.
 #[derive(Debug)]
-pub struct ValidatorConfig<V: ProvideValidatorMetadata> {
+struct ValidatorConfig<V: ProvideValidatorMetadata> {
     validator: V,
-    base_url: Option<String>,
-    validator_data: ValidatorData,
+    base_url: Option<Uri>,
 }
 
 impl<V, E, S> Layer<S> for ValidatorLayer<V, E>
@@ -192,7 +586,14 @@ where
     type Service = ValidatorService<V, E, S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        ValidatorService::new(inner, self.config.clone(), self.error_body.clone())
+        ValidatorService::new(
+            inner,
+            self.config.clone(),
+            self.validator_data.clone(),
+            self.error_body.clone(),
+            self.extractor_error_body.clone(),
+            self.resource_audiences.clone(),
+        )
     }
 }
 
@@ -206,7 +607,10 @@ where
 {
     inner: S,
     config: Arc<ValidatorConfig<V>>,
+    validator_data: ValidatorData,
     error_body: Option<E>,
+    extractor_error_body: Option<ErrorBodyRenderer>,
+    resource_audiences: Option<Arc<Vec<String>>>,
 }
 
 impl<V, E, S> Clone for ValidatorService<V, E, S>
@@ -219,7 +623,10 @@ where
         Self {
             inner: self.inner.clone(),
             config: self.config.clone(),
+            validator_data: self.validator_data.clone(),
             error_body: self.error_body.clone(),
+            extractor_error_body: self.extractor_error_body.clone(),
+            resource_audiences: self.resource_audiences.clone(),
         }
     }
 }
@@ -230,13 +637,22 @@ where
     E: ErrorBody,
     S: Clone,
 {
-    /// Constructs the service directly; normally produced by [`ValidatorLayer`]'s
-    /// [`Layer`] impl.
-    pub fn new(inner: S, config: Arc<ValidatorConfig<V>>, error_body: Option<E>) -> Self {
+    /// Constructs the service for [`ValidatorLayer`]'s [`Layer`] implementation.
+    fn new(
+        inner: S,
+        config: Arc<ValidatorConfig<V>>,
+        validator_data: ValidatorData,
+        error_body: Option<E>,
+        extractor_error_body: Option<ErrorBodyRenderer>,
+        resource_audiences: Option<Arc<Vec<String>>>,
+    ) -> Self {
         Self {
             inner,
             config,
+            validator_data,
             error_body,
+            extractor_error_body,
+            resource_audiences,
         }
     }
 }
@@ -263,12 +679,26 @@ where
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
         let config = self.config.clone();
+        let validator_data = self.validator_data.clone();
         let error_body = self.error_body.clone();
+        let extractor_error_body = self.extractor_error_body.clone();
+        let resource_audiences = self.resource_audiences.clone();
 
         Box::pin(async move {
-            let uri = get_request_uri(&config, &req);
+            let Some(uri) = get_request_uri(&config, &req) else {
+                // The configured base URL was validated when the layer was
+                // built, so this can only reflect an unexpected URI component
+                // combination. Fail closed rather than validating a DPoP proof
+                // against a different origin-form URI.
+                let mut response = http::Response::new(axum_core::body::Body::empty());
+                *response.status_mut() = http::StatusCode::INTERNAL_SERVER_ERROR;
+                return Ok(response.into_response());
+            };
 
-            req.extensions_mut().insert(config.validator_data.clone());
+            req.extensions_mut().insert(validator_data.clone());
+            if let Some(renderer) = extractor_error_body {
+                req.extensions_mut().insert(renderer);
+            }
 
             let cert = req
                 .extensions()
@@ -284,34 +714,63 @@ where
 
             match validation_result.outcome {
                 Ok(Some(validated_request)) => {
+                    if let Some(accepted_audiences) = resource_audiences
+                        && !accepted_audiences
+                            .iter()
+                            .any(|accepted| validated_request.aud.contains(accepted))
+                    {
+                        let challenge = huskarl_resource_server::error::Challenge::new(
+                            TokenValidationError::Client(TokenErrorCode::InvalidToken),
+                        )
+                        .with_description(
+                            "The access token audience does not match the protected resource",
+                        );
+                        let challenges = validator_data.inner.challenges_from(
+                            None,
+                            Some(&challenge),
+                            None,
+                            None,
+                        );
+                        let details = FailureDetails {
+                            error_code: Some(TokenErrorCode::InvalidToken),
+                            error_description: challenge.description,
+                            required_scopes: None,
+                        };
+                        return Ok(challenge_response(
+                            &error_body,
+                            http::StatusCode::UNAUTHORIZED,
+                            &details,
+                            challenges,
+                            dpop_nonce,
+                            None,
+                        ));
+                    }
                     req.extensions_mut().insert(HasValidToken);
                     req.extensions_mut()
                         .insert(ValidatedToken(Arc::new(validated_request)));
                 }
                 Ok(None) => {}
                 Err(err) => {
-                    let token_error = err.token_error();
-                    let status = token_error.suggested_status();
+                    let challenge = err.challenge();
+                    let mut rejection = validator_data.inner.rejection_from(&err, &challenge, None);
+                    rejection.dpop_nonce = dpop_nonce;
                     // Server-side failures deliberately reveal no error details
                     // (see `TokenValidationError`); pass none to the body either.
-                    let details = match token_error {
+                    let details = match &challenge.error {
                         TokenValidationError::Client(code) => FailureDetails {
-                            error_code: Some(code),
-                            error_description: err.error_description(),
+                            error_code: Some(*code),
+                            error_description: challenge.description.clone(),
                             required_scopes: None,
                         },
-                        TokenValidationError::Server(_) => FailureDetails::unauthenticated(),
+                        TokenValidationError::Server { .. } => FailureDetails::unauthenticated(),
                     };
-                    let challenges = config
-                        .validator_data
-                        .inner
-                        .challenges(Some(&err), None, None);
                     return Ok(challenge_response(
                         &error_body,
-                        status,
+                        rejection.status,
                         &details,
-                        challenges,
-                        dpop_nonce,
+                        rejection.www_authenticate,
+                        rejection.dpop_nonce,
+                        rejection.retry_after,
                     ));
                 }
             }
@@ -358,6 +817,7 @@ pub(crate) fn challenge_response<E: ErrorBody>(
     details: &FailureDetails,
     challenges: Vec<String>,
     dpop_nonce: Option<String>,
+    retry_after: Option<huskarl_resource_server::core::platform::Duration>,
 ) -> Response {
     match error_body {
         Some(eb) => {
@@ -372,6 +832,7 @@ pub(crate) fn challenge_response<E: ErrorBody>(
                 status,
                 challenges,
                 dpop_nonce,
+                retry_after,
                 body,
             }
             .into_response()
@@ -380,25 +841,29 @@ pub(crate) fn challenge_response<E: ErrorBody>(
             status,
             challenges,
             dpop_nonce,
+            retry_after,
             body: (),
         }
         .into_response(),
     }
 }
 
-fn get_request_uri<V: ProvideValidatorMetadata>(config: &ValidatorConfig<V>, req: &Request) -> Uri {
-    req.extensions()
-        .get::<RequestUrl>()
-        .map(|r| r.0.clone())
-        .or_else(|| {
-            config.base_url.as_ref().and_then(|base| {
-                let base = base.trim_end_matches('/');
-                let pq = req
-                    .uri()
-                    .path_and_query()
-                    .map_or("/", http::uri::PathAndQuery::as_str);
-                format!("{base}{pq}").parse().ok()
-            })
-        })
-        .unwrap_or_else(|| req.uri().clone())
+fn get_request_uri<V: ProvideValidatorMetadata>(
+    config: &ValidatorConfig<V>,
+    req: &Request,
+) -> Option<Uri> {
+    if let Some(request_url) = req.extensions().get::<RequestUrl>() {
+        return Some(request_url.0.clone());
+    }
+
+    let uri = crate::extensions::original_uri(req.uri(), req.extensions());
+    let Some(base) = &config.base_url else {
+        return Some(uri.clone());
+    };
+
+    let path_and_query = uri
+        .path_and_query()
+        .cloned()
+        .unwrap_or_else(|| http::uri::PathAndQuery::from_static("/"));
+    join_base_url(base, &path_and_query)
 }

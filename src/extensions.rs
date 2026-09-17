@@ -11,6 +11,14 @@ use std::sync::Arc;
 use http::Uri;
 use huskarl_resource_server::validator::metadata::ValidatorMetadata;
 
+/// The request URI before Axum stripped any router nesting prefixes.
+/// Plain Tower services do not have an `OriginalUri` extension.
+pub(crate) fn original_uri<'a>(uri: &'a Uri, extensions: &'a http::Extensions) -> &'a Uri {
+    extensions
+        .get::<axum::extract::OriginalUri>()
+        .map_or(uri, |original| &original.0)
+}
+
 /// Request extension carrying the validator's metadata, used to build the
 /// `WWW-Authenticate` challenges when a token is missing or rejected.
 #[derive(Debug, Clone)]
@@ -26,22 +34,24 @@ pub struct ValidatorData {
 pub struct HasValidToken;
 
 /// Client certificate DER bytes, injected by the TLS acceptor layer for mTLS connections.
+#[derive(Clone)]
 pub struct ClientCertDer(pub Vec<u8>);
 
 /// The effective request URL (scheme + authority + path) the auth layers should treat
 /// as the request target, injected by an outer middleware when the server sits behind a
 /// reverse proxy that rewrites the URI. Takes precedence over the validator layer's
-/// `base_url` for DPoP `htu` reconstruction.
+/// `base_url` for `DPoP` `htu` reconstruction.
 ///
 /// # Security
 ///
-/// This value is trusted verbatim for DPoP `htu` binding, so the middleware that
+/// This value is trusted verbatim for `DPoP` `htu` binding, so the middleware that
 /// sets it MUST derive it from a source the client cannot spoof: a configured
 /// origin, or forwarded headers a proxy you control sets (overwriting any
 /// client-supplied copy) and that clients cannot bypass. Deriving it straight
 /// from the inbound `Host` / `X-Forwarded-Host` / `Forwarded` header lets an
 /// attacker spoof it to match a captured proof's `htu`. When a single static
 /// origin suffices, prefer the validator layer's `base_url`.
+#[derive(Clone)]
 pub struct RequestUrl(pub Uri);
 
 /// Passes scopes already required and validated, so nested middleware can fail with the right
