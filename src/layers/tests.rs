@@ -281,6 +281,144 @@ fn request() -> Request {
 }
 
 #[tokio::test]
+async fn nested_protected_resource_requires_its_own_valid_token()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (mock, expected) in [
+        (MockValidator::no_token(), StatusCode::UNAUTHORIZED),
+        (MockValidator::invalid(), StatusCode::UNAUTHORIZED),
+        (MockValidator::valid(&["admin"]), StatusCode::UNAUTHORIZED),
+        (
+            MockValidator::valid(&["admin"])
+                .with_source("https://issuer.example", &["https://api.example/private"]),
+            StatusCode::OK,
+        ),
+    ] {
+        let outer = ValidatorLayer::builder()
+            .validator(MockValidator::valid(&["admin"]))
+            .build();
+        let (inner, _) = ValidatorLayer::builder()
+            .validator(mock)
+            .base_url("https://api.example")?
+            .build()
+            .with_protected_resource("/private", AudienceBinding::ResourceIdentifier, ["admin"])?;
+
+        let reached: Reached = Arc::default();
+        let response = outer
+            .layer(inner.layer(handler(reached.clone())))
+            .oneshot(request())
+            .await?;
+        assert_eq!(response.status(), expected);
+        assert_eq!(reached.load(Ordering::SeqCst), expected == StatusCode::OK);
+
+        let reached: Reached = Arc::default();
+        let response = outer
+            .layer(
+                inner
+                    .require_scopes(["admin"])
+                    .layer(handler(reached.clone())),
+            )
+            .oneshot(request())
+            .await?;
+        assert_eq!(response.status(), expected);
+        assert_eq!(reached.load(Ordering::SeqCst), expected == StatusCode::OK);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn nested_optional_validator_clears_outer_authentication()
+-> Result<(), Box<dyn std::error::Error>> {
+    let outer = ValidatorLayer::builder()
+        .validator(MockValidator::valid(&["admin"]))
+        .error_body(DetailsBody)
+        .build();
+    let inner = ValidatorLayer::builder()
+        .validator(MockValidator::no_token())
+        .build();
+    let app = Router::new()
+        .route(
+            "/optional",
+            get(|token: Option<ValidatedToken<TestClaims>>| async move {
+                assert!(token.is_none());
+            }),
+        )
+        .route("/required", get(|_: ValidatedToken<TestClaims>| async {}))
+        .layer(inner)
+        .layer(outer);
+
+    let response = app
+        .clone()
+        .oneshot(Request::builder().uri("/optional").body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = app
+        .oneshot(Request::builder().uri("/required").body(Body::empty())?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(to_bytes(response.into_body(), usize::MAX).await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn nested_validator_clears_tokens_with_a_different_claims_type()
+-> Result<(), Box<dyn std::error::Error>> {
+    struct NoUnitToken;
+
+    impl AccessTokenValidator for NoUnitToken {
+        type Claims = ();
+        type Error = MockError;
+
+        fn validate_request<'a>(
+            &'a self,
+            _: &'a HeaderMap,
+            _: &'a Method,
+            _: &'a Uri,
+            _: Option<&'a [u8]>,
+        ) -> huskarl_resource_server::core::platform::MaybeSendBoxFuture<
+            'a,
+            ValidationResult<Self::Claims, Self::Error>,
+        > {
+            Box::pin(async {
+                ValidationResult {
+                    outcome: Ok(None),
+                    dpop_nonce: None,
+                }
+            })
+        }
+    }
+
+    impl ProvideValidatorMetadata for NoUnitToken {
+        fn validator_metadata(&self, resource: Option<&str>) -> ValidatorMetadata {
+            MockValidator::no_token().validator_metadata(resource)
+        }
+    }
+
+    let outer = ValidatorLayer::builder()
+        .validator(MockValidator::valid(&["admin"]))
+        .build();
+    let inner = ValidatorLayer::builder().validator(NoUnitToken).build();
+    let app = Router::new()
+        .route(
+            "/",
+            get(|token: Option<ValidatedToken<TestClaims>>| async move {
+                assert!(token.is_none());
+            }),
+        )
+        .layer(inner.clone())
+        .layer(outer.clone());
+    assert_eq!(app.oneshot(request()).await?.status(), StatusCode::OK);
+
+    let reached: Reached = Arc::default();
+    let response = outer
+        .layer(inner.authenticated().layer(handler(reached.clone())))
+        .oneshot(request())
+        .await?;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(!reached.load(Ordering::SeqCst));
+    Ok(())
+}
+
+#[tokio::test]
 async fn protected_resource_boundary_is_the_router_not_the_identifier()
 -> Result<(), Box<dyn std::error::Error>> {
     for (mock, protected_status) in [

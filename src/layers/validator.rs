@@ -175,6 +175,11 @@ fn parse_resource_identifier(value: &str) -> Result<String, InvalidResourceIdent
 /// When no token is present, this layer by itself passes the request through so
 /// handlers can use `Option<ValidatedToken<_>>`. Use one of the composite
 /// layers whenever authentication is required.
+///
+/// A nested validator replaces the preceding validator's authentication
+/// state, even when they use different claims types. If the inner validator
+/// finds no token, downstream gates and extractors see an unauthenticated
+/// request; they cannot reuse the outer validator's token.
 pub struct ValidatorLayer<V: ProvideValidatorMetadata, E: ErrorBody = ()> {
     config: Arc<ValidatorConfig<V>>,
     validator_data: ValidatorData,
@@ -619,6 +624,26 @@ struct ValidatorConfig<V: ProvideValidatorMetadata> {
     base_url: Option<Uri>,
 }
 
+// Remember how to remove the previous validator's token even when a nested
+// validator uses a different claims type.
+#[derive(Clone, Copy)]
+struct ValidatedTokenCleanup(fn(&mut http::Extensions));
+
+fn remove_validated_token<C: Send + Sync + 'static>(extensions: &mut http::Extensions) {
+    extensions.remove::<ValidatedToken<C>>();
+}
+
+// Each validator establishes its own authentication boundary. An absent token
+// must not inherit authentication or error rendering from an outer layer.
+fn clear_authentication<C: Send + Sync + 'static>(extensions: &mut http::Extensions) {
+    if let Some(cleanup) = extensions.remove::<ValidatedTokenCleanup>() {
+        (cleanup.0)(extensions);
+    }
+    remove_validated_token::<C>(extensions);
+    extensions.remove::<HasValidToken>();
+    extensions.remove::<ErrorBodyRenderer>();
+}
+
 impl<V, E, S> Layer<S> for ValidatorLayer<V, E>
 where
     V: AccessTokenValidator + ProvideValidatorMetadata,
@@ -737,6 +762,7 @@ where
                 return Ok(response.into_response());
             };
 
+            clear_authentication::<V::Claims>(req.extensions_mut());
             req.extensions_mut().insert(validator_data.clone());
             if let Some(renderer) = extractor_error_body {
                 req.extensions_mut().insert(renderer);
@@ -790,6 +816,8 @@ where
                     req.extensions_mut().insert(HasValidToken);
                     req.extensions_mut()
                         .insert(ValidatedToken(Arc::new(validated_request)));
+                    req.extensions_mut()
+                        .insert(ValidatedTokenCleanup(remove_validated_token::<V::Claims>));
                 }
                 Ok(None) => {}
                 Err(err) => {
