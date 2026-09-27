@@ -281,6 +281,177 @@ fn request() -> Request {
 }
 
 #[tokio::test]
+async fn protected_resource_boundary_is_the_router_not_the_identifier()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (mock, protected_status) in [
+        (MockValidator::no_token(), StatusCode::UNAUTHORIZED),
+        (
+            MockValidator::valid(&[]).with_source(
+                "https://issuer.example",
+                &["https://api.example/mcp/inventory"],
+            ),
+            StatusCode::OK,
+        ),
+        (MockValidator::valid(&[]), StatusCode::UNAUTHORIZED),
+    ] {
+        let (protection, metadata) = ValidatorLayer::builder()
+            .validator(mock)
+            .base_url("https://api.example")?
+            .build()
+            .with_protected_resource(
+                "/mcp/inventory",
+                AudienceBinding::ResourceIdentifier,
+                ["write"],
+            )?;
+        let app = Router::new()
+            .nest(
+                "/mcp/inventory",
+                Router::new()
+                    .route("/items", get(|| async {}))
+                    .route("/items/{id}", get(|| async {}))
+                    .layer(protection.clone()),
+            )
+            .merge(
+                Router::new()
+                    .route("/alias", get(|| async {}))
+                    .layer(protection),
+            )
+            .route("/mcp/inventory/public", get(|| async {}))
+            .route("/mcp/inventory-other", get(|| async {}))
+            .route_service(metadata.path(), metadata.clone());
+
+        for (path, expected) in [
+            ("/mcp/inventory/items", protected_status),
+            ("/mcp/inventory/items/42?detail=full", protected_status),
+            ("/alias", protected_status),
+            ("/mcp/inventory/public", StatusCode::OK),
+            ("/mcp/inventory-other", StatusCode::OK),
+            (metadata.path(), StatusCode::OK),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(http::Request::builder().uri(path).body(Body::empty())?)
+                .await?;
+            assert_eq!(response.status(), expected, "{path}");
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn optional_resource_authentication_still_validates_presented_tokens()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (mock, expected) in [
+        (MockValidator::no_token(), StatusCode::OK),
+        (MockValidator::valid(&[]), StatusCode::OK),
+        (MockValidator::invalid(), StatusCode::UNAUTHORIZED),
+        (
+            MockValidator::valid(&[]).with_source("https://issuer.example", &["other-api"]),
+            StatusCode::UNAUTHORIZED,
+        ),
+    ] {
+        let (optional, _metadata) = ValidatorLayer::builder()
+            .validator(mock)
+            .base_url("https://api.example")?
+            .build()
+            .with_optional_authentication_resource(
+                "/mcp",
+                AudienceBinding::mapped(["my-api"]),
+                ["write"],
+            )?;
+        let reached: Reached = Arc::default();
+        let response = optional
+            .layer(handler(reached.clone()))
+            .oneshot(request())
+            .await?;
+        assert_eq!(response.status(), expected);
+        assert_eq!(reached.load(Ordering::SeqCst), expected == StatusCode::OK);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn protected_resource_permissions_preserve_authentication_and_audience_checks()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (mock, expected) in [
+        (MockValidator::no_token(), StatusCode::UNAUTHORIZED),
+        (MockValidator::valid(&[]), StatusCode::FORBIDDEN),
+        (MockValidator::valid(&["write"]), StatusCode::OK),
+        (
+            MockValidator::valid(&["write"]).with_source("https://issuer.example", &["other-api"]),
+            StatusCode::UNAUTHORIZED,
+        ),
+    ] {
+        let (protection, _metadata) = ValidatorLayer::builder()
+            .validator(mock)
+            .base_url("https://api.example")?
+            .build()
+            .with_protected_resource("/mcp", AudienceBinding::mapped(["my-api"]), ["write"])?;
+        let reached: Reached = Arc::default();
+        let scoped = protection
+            .require_scopes(["write"])
+            .layer(handler(reached.clone()))
+            .oneshot(request())
+            .await?;
+        assert_eq!(scoped.status(), expected);
+        assert_eq!(reached.load(Ordering::SeqCst), expected == StatusCode::OK);
+
+        let reached: Reached = Arc::default();
+        let authorized = protection
+            .authorize(|token| {
+                if token.claims.has_scope("write") {
+                    Ok(())
+                } else {
+                    Err(AuthorizationError::Forbidden("write required".to_owned()))
+                }
+            })
+            .layer(handler(reached.clone()))
+            .oneshot(request())
+            .await?;
+        assert_eq!(authorized.status(), expected);
+        assert_eq!(reached.load(Ordering::SeqCst), expected == StatusCode::OK);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn resource_isolation_depends_on_audience_bindings() -> Result<(), Box<dyn std::error::Error>>
+{
+    for shared in [false, true] {
+        for path in ["/inventory", "/payments"] {
+            let audience = if shared {
+                "shared-api"
+            } else {
+                "https://api.example/inventory"
+            };
+            let binding = if shared {
+                AudienceBinding::mapped(["shared-api"])
+            } else {
+                AudienceBinding::ResourceIdentifier
+            };
+            let (protection, _metadata) = ValidatorLayer::builder()
+                .validator(
+                    MockValidator::valid(&[]).with_source("https://issuer.example", &[audience]),
+                )
+                .base_url("https://api.example")?
+                .build()
+                .with_protected_resource(path, binding, std::iter::empty::<String>())?;
+            let response = protection
+                .layer(handler(Arc::default()))
+                .oneshot(http::Request::builder().uri(path).body(Body::empty())?)
+                .await?;
+            let expected = if shared || path == "/inventory" {
+                StatusCode::OK
+            } else {
+                StatusCode::UNAUTHORIZED
+            };
+            assert_eq!(response.status(), expected, "shared={shared}, path={path}");
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn resource_metadata_is_served_and_advertised() -> Result<(), Box<dyn std::error::Error>> {
     let validator = ValidatorLayer::builder()
         .validator(MockValidator::no_token())
@@ -296,7 +467,7 @@ async fn resource_metadata_is_served_and_advertised() -> Result<(), Box<dyn std:
 
     let protected = Router::new()
         .route("/protected", get(|| async {}))
-        .layer(validator.authenticated());
+        .layer(validator);
     let app = Router::new()
         .route_service(metadata.path(), metadata.clone())
         .merge(protected);
@@ -405,7 +576,7 @@ async fn resource_metadata_preserves_path_resource_identifier()
         .base_url("https://api.example")?
         .build();
     let (validator, metadata) = validator.with_protected_resource(
-        "/tenant/one?version=1",
+        "/tenant/one",
         AudienceBinding::ResourceIdentifier,
         std::iter::empty::<String>(),
     )?;
@@ -416,28 +587,25 @@ async fn resource_metadata_preserves_path_resource_identifier()
     );
     assert_eq!(
         metadata.uri(),
-        "https://api.example/.well-known/oauth-protected-resource/tenant/one?version=1"
+        "https://api.example/.well-known/oauth-protected-resource/tenant/one"
     );
     let metadata_path = metadata.path().to_owned();
     let app = Router::new().route_service(&metadata_path, metadata).merge(
         Router::new()
             .route("/tenant/one/items", get(|| async {}))
-            .layer(validator.authenticated()),
+            .layer(validator),
     );
     let response = app
         .clone()
         .oneshot(
             http::Request::builder()
-                .uri("/.well-known/oauth-protected-resource/tenant/one?version=1")
+                .uri("/.well-known/oauth-protected-resource/tenant/one")
                 .body(Body::empty())?,
         )
         .await?;
     let body = to_bytes(response.into_body(), usize::MAX).await?;
     let document: serde_json::Value = serde_json::from_slice(&body)?;
-    assert_eq!(
-        document["resource"],
-        "https://api.example/tenant/one?version=1"
-    );
+    assert_eq!(document["resource"], "https://api.example/tenant/one");
 
     let response = app
         .oneshot(
@@ -449,9 +617,7 @@ async fn resource_metadata_preserves_path_resource_identifier()
     assert!(
         response.headers()[header::WWW_AUTHENTICATE]
             .to_str()?
-            .contains(
-                "https://api.example/.well-known/oauth-protected-resource/tenant/one?version=1"
-            )
+            .contains("https://api.example/.well-known/oauth-protected-resource/tenant/one")
     );
     Ok(())
 }
@@ -486,12 +652,12 @@ async fn one_origin_can_host_multiple_protected_resources() -> Result<(), Box<dy
         .merge(
             Router::new()
                 .route("/payments/item", get(|| async {}))
-                .layer(payments.authenticated()),
+                .layer(payments),
         )
         .merge(
             Router::new()
                 .route("/inventory/item", get(|| async {}))
-                .layer(inventory.authenticated()),
+                .layer(inventory),
         );
 
     for (path, resource_path) in [
@@ -530,7 +696,7 @@ async fn protected_resource_enforces_resource_identifier_audience()
         AudienceBinding::ResourceIdentifier,
         std::iter::empty::<String>(),
     )?;
-    let stack = validator.authenticated().layer(handler(reached.clone()));
+    let stack = validator.layer(handler(reached.clone()));
 
     let response = stack.oneshot(request()).await?;
 
@@ -559,7 +725,7 @@ async fn protected_resource_accepts_mapped_audience() -> Result<(), Box<dyn std:
         AudienceBinding::mapped(["api://inventory"]),
         std::iter::empty::<String>(),
     )?;
-    let stack = validator.authenticated().layer(handler(reached.clone()));
+    let stack = validator.layer(handler(reached.clone()));
 
     let response = stack.oneshot(request()).await?;
 
@@ -585,7 +751,7 @@ async fn protected_resource_supports_a_trusted_public_url_after_path_rewrite()
         AudienceBinding::ResourceIdentifier,
         std::iter::empty::<String>(),
     )?;
-    let stack = validator.authenticated().layer(handler(Arc::default()));
+    let stack = validator.layer(handler(Arc::default()));
     let mut request = http::Request::builder()
         .uri("/internal/inventory/tools?cursor=1")
         .body(Body::empty())?;
@@ -645,13 +811,13 @@ fn validator_layer_binds_only_one_protected_resource() -> Result<(), Box<dyn std
         .validator(MockValidator::valid(&[]))
         .base_url("https://api.example")?
         .build();
-    let (validator, _metadata) = validator.with_protected_resource(
+    let (validator, _metadata) = validator.with_optional_authentication_resource(
         "/mcp/one",
         AudienceBinding::ResourceIdentifier,
         std::iter::empty::<String>(),
     )?;
 
-    let result = validator.with_protected_resource(
+    let result = validator.with_optional_authentication_resource(
         "/mcp/two",
         AudienceBinding::ResourceIdentifier,
         std::iter::empty::<String>(),
@@ -888,7 +1054,13 @@ fn validator_accepts_a_public_base_path() -> Result<(), Box<dyn std::error::Erro
 
 #[test]
 fn resource_metadata_rejects_invalid_resource_paths() -> Result<(), Box<dyn std::error::Error>> {
-    for invalid in ["relative", "https://api.example/mcp", "/path#fragment"] {
+    for invalid in [
+        "relative",
+        "https://api.example/mcp",
+        "/path#fragment",
+        "/mcp?tenant=a",
+        "/mcp?",
+    ] {
         let validator = ValidatorLayer::builder()
             .validator(MockValidator::valid(&[]))
             .base_url("https://api.example")?

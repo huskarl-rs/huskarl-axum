@@ -118,6 +118,63 @@ cargo run --example login --features login
 
 <!-- cargo-reedme: end -->
 
+## Protected resource metadata and authorization
+
+`with_protected_resource` returns an authentication layer and a public metadata
+service. Apply the layer directly to the router containing the resource's
+endpoints, then mount metadata separately on the root router:
+
+```rust,ignore
+use axum::{Router, routing::{get, put}};
+use huskarl_axum::{layers::ValidatorLayer, resource_metadata::AudienceBinding};
+
+let (inventory, metadata) = ValidatorLayer::builder()
+    .validator(validator)
+    .base_url("https://api.example.com")?
+    .build()
+    .with_protected_resource(
+        "/inventory",
+        AudienceBinding::ResourceIdentifier,
+        ["inventory.read", "inventory.write"],
+    )?;
+
+let endpoints = Router::new()
+    .route("/items", get(list_items).layer(inventory.require_scopes(["inventory.read"])))
+    .route("/items/{id}", put(update_item).layer(inventory.require_scopes(["inventory.write"])));
+
+let app = Router::new()
+    .nest("/inventory", endpoints)
+    .route("/health", get(health))
+    .route_service(metadata.path(), metadata.clone());
+```
+
+Use `.layer(inventory)` on a router when authentication and audience validation
+alone are sufficient. Use `inventory.authorize(...)` for custom permissions.
+Each of these layers requires a token and checks the configured audience before
+allowing the handler to run. Missing tokens and audience mismatches return `401`;
+missing required scopes return `403`. The scopes supplied to
+`with_protected_resource` are advertised capabilities, not enforced permissions.
+
+The resource URL identifies the logical resource; **router placement defines the
+authorization boundary**. A route under `/inventory` is protected only if it has
+the layer. A route outside `/inventory` with that layer has the same protection.
+Mount all resource endpoints before applying a router-wide layer. The metadata
+service should remain outside the authentication layer so clients can discover
+how to authenticate.
+
+For intentionally public routes accepting optional tokens, use
+`with_optional_authentication_resource` instead. Its returned `ValidatorLayer`
+allows requests without tokens, but rejects invalid or audience-mismatched tokens.
+Resources with overlapping `AudienceBinding::mapped(...)` values accept the same
+tokens; use distinct audiences or custom authorization for isolation.
+
+Resource identifiers containing queries are rejected because metadata routes
+cannot distinguish queries. Queries on ordinary API requests remain supported.
+
+Migration: `with_protected_resource` now returns `AuthenticatedLayer` rather than
+`ValidatorLayer`. Remove the extra `.authenticated()` call and apply the returned
+layer directly, or use its `.require_scopes(...)` / `.authorize(...)` methods.
+
 ## Nested routers
 
 Authentication layers preserve `Router::nest` prefixes through Axum's

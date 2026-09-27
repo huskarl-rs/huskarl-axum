@@ -37,8 +37,8 @@ pub struct InvalidBaseUrl {
 /// invalid RFC 9728 protected-resource identifier.
 ///
 /// Resource identifiers are preserved byte-for-byte for RFC 9728's identity
-/// check. They must be absolute `https` URLs and may include a path or query,
-/// but not a fragment.
+/// check. They must be absolute `https` URLs. Local metadata endpoints support
+/// paths, but reject queries and fragments.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct InvalidResourceIdentifier {
@@ -273,13 +273,20 @@ impl<V: ProvideValidatorMetadata, E: ErrorBody, S: State> ValidatorLayerBuilder<
 }
 
 impl<V: ProvideValidatorMetadata, E: ErrorBody> ValidatorLayer<V, E> {
-    /// Configures an audience-bound RFC 9728 protected resource.
+    /// Configures an RFC 9728 resource and requires an audience-matching token.
     ///
-    /// Returns this validator layer, updated so every presented token must
-    /// match the resource's audience binding and all `WWW-Authenticate`
-    /// challenges advertise its endpoint, together with the Tower service that
-    /// serves the document. Mount the service at
-    /// [`ResourceMetadataService::path`] with Axum's `Router::route_service`.
+    /// Returns a complete authentication layer and the metadata service. Install
+    /// the layer directly on the router containing this resource's endpoints.
+    /// Mount the metadata service separately at [`ResourceMetadataService::path`]
+    /// on the root router so discovery remains accessible without a token.
+    /// Requests without a token or with the wrong audience receive `401`.
+    /// All authentication challenges advertise the metadata endpoint.
+    ///
+    /// `scopes_supported` advertises capabilities only. Use
+    /// [`AuthenticatedLayer::require_scopes`] or [`AuthenticatedLayer::authorize`]
+    /// to enforce operation-specific permissions. For intentionally public
+    /// endpoints accepting optional tokens, use
+    /// [`with_optional_authentication_resource`](Self::with_optional_authentication_resource).
     ///
     /// One configured layer represents one protected resource. Its audience
     /// and challenge metadata apply to every request routed through that
@@ -298,8 +305,9 @@ impl<V: ProvideValidatorMetadata, E: ErrorBody> ValidatorLayer<V, E> {
     /// and must begin with `/`. The base URL's path is the public rewritten
     /// prefix. For example, base URL `https://api.example.com/gateway` plus
     /// resource path `/mcp/inventory` identifies
-    /// `https://api.example.com/gateway/mcp/inventory`. A query on the resource
-    /// path is preserved.
+    /// `https://api.example.com/gateway/mcp/inventory`. Queries are rejected
+    /// because Axum cannot distinguish metadata routes by query. This restriction
+    /// applies to resource identifiers, not to incoming requests.
     ///
     /// Behind a path-rewriting proxy, an outer trusted middleware may provide
     /// [`RequestUrl`] with the complete public request URL used for `DPoP`.
@@ -313,6 +321,37 @@ impl<V: ProvideValidatorMetadata, E: ErrorBody> ValidatorLayer<V, E> {
     /// explicitly advertise a different metadata URL. URL derivation and JSON
     /// encoding failures are also reported.
     pub fn with_protected_resource<I, T>(
+        self,
+        resource_path: impl AsRef<str>,
+        audience_binding: AudienceBinding,
+        scopes_supported: I,
+    ) -> Result<(AuthenticatedLayer<V, E>, ResourceMetadataService), ResourceMetadataError>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<String>,
+    {
+        let (validator, metadata) = self.with_optional_authentication_resource(
+            resource_path,
+            audience_binding,
+            scopes_supported,
+        )?;
+        Ok((AuthenticatedLayer::new(validator), metadata))
+    }
+
+    /// Configures resource metadata and audience validation with optional authentication.
+    ///
+    /// Requests without a token pass through to the handler. Presented tokens
+    /// must be valid and match the audience binding. Use
+    /// [`with_protected_resource`](Self::with_protected_resource) when a token
+    /// must be required. The same resource URL, router placement, and metadata
+    /// mounting rules apply to both methods. Advertised scopes are not enforced.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same configuration errors as
+    /// [`with_protected_resource`](Self::with_protected_resource), including
+    /// rejection of query-bearing resource identifiers.
+    pub fn with_optional_authentication_resource<I, T>(
         mut self,
         resource_path: impl AsRef<str>,
         audience_binding: AudienceBinding,
@@ -331,7 +370,10 @@ impl<V: ProvideValidatorMetadata, E: ErrorBody> ValidatorLayer<V, E> {
             .as_ref()
             .ok_or(ResourceMetadataError::MissingBaseUrl)?;
         let resource_path = resource_path.as_ref();
-        if !resource_path.starts_with('/') || resource_path.contains('#') {
+        if !resource_path.starts_with('/')
+            || resource_path.contains('#')
+            || resource_path.contains('?')
+        {
             return Err(ResourceMetadataError::InvalidResourcePath {
                 path: resource_path.to_owned(),
             });

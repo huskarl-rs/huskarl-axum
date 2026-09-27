@@ -32,7 +32,9 @@ mod tests;
 
 /// Order-safe composition of token validation and authentication enforcement.
 ///
-/// Construct this with [`ValidatorLayer::authenticated`].
+/// Construct this with [`ValidatorLayer::authenticated`] or
+/// [`ValidatorLayer::with_protected_resource`]. Router placement determines
+/// which endpoints it protects; a configured resource URL does not filter paths.
 pub struct AuthenticatedLayer<V: ProvideValidatorMetadata, E: ErrorBody = ()> {
     validator: ValidatorLayer<V, E>,
 }
@@ -40,6 +42,35 @@ pub struct AuthenticatedLayer<V: ProvideValidatorMetadata, E: ErrorBody = ()> {
 impl<V: ProvideValidatorMetadata, E: ErrorBody> AuthenticatedLayer<V, E> {
     pub(crate) fn new(validator: ValidatorLayer<V, E>) -> Self {
         Self { validator }
+    }
+
+    /// Requires every supplied scope in addition to authentication and any
+    /// configured resource audience binding.
+    #[must_use]
+    pub fn require_scopes<I, T>(&self, required_scopes: I) -> ScopedLayer<V, E>
+    where
+        V: AccessTokenValidator,
+        V::Claims: HasScopes,
+        I: IntoIterator<Item = T>,
+        T: Into<String>,
+    {
+        self.validator.require_scopes(required_scopes)
+    }
+
+    /// Applies a custom permission check after token and resource audience
+    /// validation. Requests without a token are rejected before the check.
+    #[must_use]
+    pub fn authorize<F>(&self, check: F) -> AuthorizedLayer<V, F, E>
+    where
+        V: AccessTokenValidator,
+        F: Fn(
+                &huskarl_resource_server::validator::ValidatedRequest<V::Claims>,
+            ) -> Result<(), AuthorizationError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.validator.authorize(check)
     }
 }
 

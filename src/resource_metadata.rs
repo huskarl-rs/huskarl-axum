@@ -1,13 +1,15 @@
 //! RFC 9728 Protected Resource Metadata endpoint support.
 //!
 //! [`ResourceMetadataService`] is produced together with a configured
-//! [`ValidatorLayer`](crate::layers::ValidatorLayer) by
+//! [`AuthenticatedLayer`](crate::layers::AuthenticatedLayer) by
 //! [`ValidatorLayer::with_protected_resource`](crate::layers::ValidatorLayer::with_protected_resource).
 //! Mount every returned service at its [`path`](ResourceMetadataService::path)
 //! on the application root with Axum's `Router::route_service`. This collects
 //! independently configured MCP resources into the one deterministic
-//! well-known hierarchy. The corresponding validator layer applies only to the
-//! MCP server router or route subtree on which the application installs it.
+//! well-known hierarchy. Install the returned authentication layer on the
+//! router containing the resource's endpoints. Router placement defines the
+//! protected endpoints; the resource identifier does not filter request paths.
+//! Mount metadata outside that layer to allow discovery without a token.
 
 use std::{convert::Infallible, future::Ready, sync::Arc, task::Poll};
 
@@ -28,6 +30,10 @@ pub enum AudienceBinding {
     ResourceIdentifier,
     /// The authorization server maps the resource identifier to one of these
     /// token audience values.
+    ///
+    /// Resources accepting the same audience are not isolated by their resource
+    /// URLs. Use distinct audiences or additional authorization checks when
+    /// tokens must not be shared between resources.
     Mapped(Vec<String>),
 }
 
@@ -159,7 +165,9 @@ impl std::error::Error for ResourceMetadataError {
 ///     ["profile.read", "profile.write"],
 /// )?;
 ///
-/// let protected = Router::new().layer(validator.authenticated());
+/// let protected = Router::new()
+///     .route("/mcp", axum::routing::get(|| async { "protected" }))
+///     .layer(validator);
 /// let app = Router::new()
 ///     .route_service(metadata.path(), metadata.clone())
 ///     .merge(protected);
@@ -197,10 +205,8 @@ impl ResourceMetadataService {
 
     /// Returns the well-known path at which this service must be mounted.
     ///
-    /// If the resource identifier contains a query, RFC 9728 preserves it in
-    /// the advertised metadata URL. Axum routes only on the path component, so
-    /// that query is intentionally not included here; requests carrying it are
-    /// still routed to this service.
+    /// Resource identifiers containing queries are rejected during configuration
+    /// because Axum routes only on the path component.
     #[must_use]
     pub fn path(&self) -> &str {
         self.uri.path()
