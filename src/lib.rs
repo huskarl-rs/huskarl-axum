@@ -18,11 +18,29 @@ Specification compliant `OAuth2` resource server middleware for axum.
 This is accomplished through integration with `huskarl-resource-server` which
 provides the framework-independent features underlying this crate.
 
+# Browser-login deployment limits
+
+Before deploying the `login` feature beyond localhost:
+
+- Use HTTPS and configure the public HTTPS redirect URI; its scheme controls
+  secure cookies, even when TLS terminates before Axum.
+- Persist cookie keys and share compatible key rings across replicas. Shared
+  keys let replicas read sessions; they do not coordinate refresh exchanges.
+- Check provider rules for simultaneous refresh-token exchanges. The
+  engine does not prevent them, even within one replica.
+- Cookie sessions cannot prevent an older response from restoring browser
+  state after refresh or logout. Local logout does not end provider SSO.
+- Preserve session cookies on the response through outer middleware and reverse
+  proxies. Keep personalized responses out of shared caches.
+
+Follow the [deployment guide](https://docs.rs/huskarl-axum/latest/huskarl_axum/login/deployment/)
+for session-store choices, layer ordering, and rollout checks.
+
 # Quick start
 
 Build a validator for your claims type, then use one of its order-safe layers:
-[`authenticated`](layers::ValidatorLayer::authenticated) requires a valid
-token, while [`require_scopes`](layers::ValidatorLayer::require_scopes)
+[`authenticated`](https://docs.rs/huskarl-axum/latest/huskarl_axum/layers/struct.ValidatorLayer.html#method.authenticated) requires a valid
+token, while [`require_scopes`](https://docs.rs/huskarl-axum/latest/huskarl_axum/layers/struct.ValidatorLayer.html#method.require_scopes)
 additionally enforces scopes. Handlers extract
 [`ValidatedToken<C>`](extractors::ValidatedToken)
 (or [`TokenFor<State>`](extractors::TokenFor) when an application prefers to
@@ -93,7 +111,8 @@ async fn build() {
 
 Enable the `login` feature to add an OAuth 2.0 Authorization Code login flow,
 encrypted sessions, refresh handling, and logout routes through the
-[`login`] module. The bundled [`login::LoginLayer`] protects a whole router;
+[`login`](https://docs.rs/huskarl-axum/latest/huskarl_axum/login/) module.
+The bundled [`LoginLayer`](https://docs.rs/huskarl-axum/latest/huskarl_axum/login/struct.LoginLayer.html) protects a whole router;
 its component layers support applications with a mix of public and protected
 routes. See the runnable example for the required environment variables:
 

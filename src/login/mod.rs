@@ -6,6 +6,11 @@
 //! apps, compose [`LoginRoutesLayer`], [`LoadSessionLayer`], and
 //! [`RequireSessionLayer`] yourself via the factory methods on `LoginLayer`.
 //!
+//! Follow [Sign in to an Axum application](self::tutorial) for a complete
+//! browser walkthrough with the runnable `login` example. Before rollout, read
+//! [Deploy browser login](self::deployment) for HTTPS, refresh concurrency,
+//! session storage, and middleware response-delivery limits.
+//!
 //! # Quick start (everything protected)
 //!
 //! ```ignore
@@ -111,3 +116,13 @@ pub use layer::{LoginLayer, LoginService};
 pub use load_session::{LoadSessionLayer, LoadSessionService, SessionLoadAttempted};
 pub use login_routes::{LoginRoutesLayer, LoginRoutesService};
 pub use require_session::{RequireSessionLayer, RequireSessionService, UnauthenticatedAction};
+
+/// Sign in, inspect a session, and sign out using the runnable Axum example.
+#[cfg(any(doc, doctest))]
+#[doc = include_str!("../../docs/tutorial/browser_login.md")]
+pub mod tutorial {}
+
+/// Deploy browser login with explicit storage, concurrency, and response-delivery limits.
+#[cfg(any(doc, doctest))]
+#[doc = include_str!("../../docs/how_to/deployment.md")]
+pub mod deployment {}

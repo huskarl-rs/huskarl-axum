@@ -38,6 +38,8 @@ jobs:
         with:
           workspaces: huskarl-axum -> target
       - run: cargo test --all-features
+      - run: cargo test --doc --all-features
+      - run: cargo test --example login --features login
       - run: cargo test --no-default-features
 
   quality:

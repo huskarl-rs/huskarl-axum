@@ -34,12 +34,31 @@ Specification compliant `OAuth2` resource server middleware for axum.
 This is accomplished through integration with `huskarl-resource-server` which
 provides the framework-independent features underlying this crate.
 
+## Browser-login deployment limits
+
+Before deploying the `login` feature beyond localhost:
+
+- Use HTTPS and configure the public HTTPS redirect URI; its scheme controls
+  secure cookies, even when TLS terminates before Axum.
+- Persist cookie keys and share compatible key rings across replicas. Shared
+  keys let replicas read sessions; they do not coordinate refresh exchanges.
+- Check provider rules for simultaneous refresh-token exchanges. The
+  engine does not prevent them, even within one replica.
+- Cookie sessions cannot prevent an older response from restoring browser
+  state after refresh or logout. Local logout does not end provider SSO.
+- Preserve session cookies on the response through outer middleware and reverse
+  proxies. Keep personalized responses out of shared caches.
+
+Follow the [deployment guide](https://docs.rs/huskarl-axum/latest/huskarl_axum/login/deployment/)
+for session-store choices, layer ordering, and rollout checks.
+
 ## Quick start
 
 Build a validator for your claims type, then use one of its order-safe layers:
 [`authenticated`](https://docs.rs/huskarl-axum/latest/huskarl_axum/layers/struct.ValidatorLayer.html#method.authenticated) requires a valid
 token, while [`require_scopes`](https://docs.rs/huskarl-axum/latest/huskarl_axum/layers/struct.ValidatorLayer.html#method.require_scopes)
-additionally enforces scopes. Handlers extract [`ValidatedToken<C>`](https://docs.rs/huskarl-axum/latest/huskarl_axum/extractors/struct.ValidatedToken.html)
+additionally enforces scopes. Handlers extract
+[`ValidatedToken<C>`](https://docs.rs/huskarl-axum/latest/huskarl_axum/extractors/struct.ValidatedToken.html)
 (or [`TokenFor<State>`](https://docs.rs/huskarl-axum/latest/huskarl_axum/extractors/type.TokenFor.html) when an application prefers to
 declare the claims type on its router state).
 
@@ -108,7 +127,8 @@ async fn build() {
 
 Enable the `login` feature to add an OAuth 2.0 Authorization Code login flow,
 encrypted sessions, refresh handling, and logout routes through the
-[`login`](https://docs.rs/huskarl-axum/latest/huskarl_axum/login/) module. The bundled [`login::LoginLayer`](https://docs.rs/huskarl-axum/latest/huskarl_axum/login/layer/struct.LoginLayer.html) protects a whole router;
+[`login`](https://docs.rs/huskarl-axum/latest/huskarl_axum/login/) module.
+The bundled [`LoginLayer`](https://docs.rs/huskarl-axum/latest/huskarl_axum/login/struct.LoginLayer.html) protects a whole router;
 its component layers support applications with a mix of public and protected
 routes. See the runnable example for the required environment variables:
 
@@ -194,3 +214,6 @@ A trusted `RequestUrl` extension still takes precedence. Login applies its
 configured `base_path`/`strip_prefix` mapping to that URI, so the override must
 agree with the configured callback/logout paths and proxy mapping. Mount
 protected-resource metadata services at their advertised paths on the root router.
+
+Follow [Sign in to an Axum application](docs/tutorial/browser_login.md) for a
+step-by-step browser walkthrough with the login example.
