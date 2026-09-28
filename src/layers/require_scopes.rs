@@ -11,7 +11,7 @@ use tower::{Layer, Service};
 use crate::extensions::{AncestorRequiredScopes, ValidatorData};
 use crate::extractors::ValidatedToken;
 use crate::layers::validator::{FailureDetails, challenge_response};
-use crate::response::ErrorBody;
+use crate::response::ErrorBodyRenderer;
 
 /// Checks the scopes granted to a token, for [`RequireScopesLayer`] enforcement.
 ///
@@ -39,11 +39,20 @@ impl<E> HasScopes for huskarl_resource_server::validator::rfc9068::Rfc9068Access
 /// indicates a middleware-ordering bug. Prefer
 /// [`ValidatorLayer::require_scopes`](super::ValidatorLayer::require_scopes),
 /// which composes validation and scope enforcement in the correct order.
-#[derive(Clone)]
-pub struct RequireScopesLayer<C, E: ErrorBody = ()> {
+pub struct RequireScopesLayer<C> {
     required_scopes: Vec<String>,
-    error_body: Option<E>,
-    phantom: PhantomData<C>,
+    error_body: Option<ErrorBodyRenderer>,
+    phantom: PhantomData<fn() -> C>,
+}
+
+impl<C> Clone for RequireScopesLayer<C> {
+    fn clone(&self) -> Self {
+        Self {
+            required_scopes: self.required_scopes.clone(),
+            error_body: self.error_body.clone(),
+            phantom: PhantomData,
+        }
+    }
 }
 
 impl<C> RequireScopesLayer<C> {
@@ -60,10 +69,8 @@ impl<C> RequireScopesLayer<C> {
             phantom: PhantomData,
         }
     }
-}
 
-impl<C, E: ErrorBody> RequireScopesLayer<C, E> {
-    pub(crate) fn with_options(scopes: Vec<String>, error_body: Option<E>) -> Self {
+    pub(crate) fn with_options(scopes: Vec<String>, error_body: Option<ErrorBodyRenderer>) -> Self {
         RequireScopesLayer {
             required_scopes: scopes,
             error_body,
@@ -72,8 +79,8 @@ impl<C, E: ErrorBody> RequireScopesLayer<C, E> {
     }
 }
 
-impl<C, E: ErrorBody, S> Layer<S> for RequireScopesLayer<C, E> {
-    type Service = RequireScopesService<C, E, S>;
+impl<C, S> Layer<S> for RequireScopesLayer<C> {
+    type Service = RequireScopesService<C, S>;
 
     fn layer(&self, inner: S) -> Self::Service {
         RequireScopesService::new(inner, self.required_scopes.clone(), self.error_body.clone())
@@ -82,14 +89,14 @@ impl<C, E: ErrorBody, S> Layer<S> for RequireScopesLayer<C, E> {
 
 /// The [`Service`] produced by [`RequireScopesLayer`]; you don't
 /// normally name this directly.
-pub struct RequireScopesService<C, E: ErrorBody, S> {
+pub struct RequireScopesService<C, S> {
     inner: S,
     required_scopes: Vec<String>,
-    error_body: Option<E>,
-    phantom: PhantomData<C>,
+    error_body: Option<ErrorBodyRenderer>,
+    phantom: PhantomData<fn() -> C>,
 }
 
-impl<C, E: ErrorBody, S: Clone> Clone for RequireScopesService<C, E, S> {
+impl<C, S: Clone> Clone for RequireScopesService<C, S> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -100,10 +107,10 @@ impl<C, E: ErrorBody, S: Clone> Clone for RequireScopesService<C, E, S> {
     }
 }
 
-impl<C, E: ErrorBody, S> RequireScopesService<C, E, S> {
+impl<C, S> RequireScopesService<C, S> {
     /// Constructs the service directly; normally produced by
     /// [`RequireScopesLayer`]'s [`Layer`] impl.
-    fn new(inner: S, scopes: Vec<String>, error_body: Option<E>) -> Self {
+    fn new(inner: S, scopes: Vec<String>, error_body: Option<ErrorBodyRenderer>) -> Self {
         Self {
             inner,
             required_scopes: scopes,
@@ -113,12 +120,11 @@ impl<C, E: ErrorBody, S> RequireScopesService<C, E, S> {
     }
 }
 
-impl<C, E, S> Service<Request> for RequireScopesService<C, E, S>
+impl<C, S> Service<Request> for RequireScopesService<C, S>
 where
     S: Service<Request, Response = Response> + Send + Clone + 'static,
     S::Future: Send + 'static,
     C: HasScopes + Send + Sync + 'static,
-    E: ErrorBody,
 {
     type Response = S::Response;
     type Error = S::Error;
@@ -176,7 +182,7 @@ where
                     required_scopes: Some(all_required_scopes.clone()),
                 };
                 return Ok(challenge_response(
-                    &error_body,
+                    error_body.as_ref(),
                     StatusCode::UNAUTHORIZED,
                     &details,
                     challenges,
@@ -201,7 +207,7 @@ where
                         required_scopes: Some(all_required_scopes.clone()),
                     };
                     return Ok(challenge_response(
-                        &error_body,
+                        error_body.as_ref(),
                         StatusCode::FORBIDDEN,
                         &details,
                         challenges,

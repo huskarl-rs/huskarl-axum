@@ -33,8 +33,11 @@ impl ErrorBody for ApiErrors {
     }
 }
 # fn configure<V>(validator: V)
-# where V: huskarl_axum::resource_server::validator::AccessTokenValidator
-#     + huskarl_axum::resource_server::validator::metadata::ProvideValidatorMetadata {
+# where V: huskarl_axum::resource_server::validator::AccessTokenValidator<
+#         Claims: Send + Sync + 'static,
+#         Error: 'static,
+#     > + huskarl_axum::resource_server::validator::metadata::ProvideValidatorMetadata
+#     + 'static {
 let layer = huskarl_axum::layers::ValidatorLayer::builder()
     .validator(validator)
     .error_body(ApiErrors)

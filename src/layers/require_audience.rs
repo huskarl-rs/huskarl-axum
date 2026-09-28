@@ -11,7 +11,7 @@ use tower::{Layer, Service};
 use crate::extensions::ValidatorData;
 use crate::extractors::ValidatedToken;
 use crate::layers::validator::{FailureDetails, challenge_response};
-use crate::response::ErrorBody;
+use crate::response::ErrorBodyRenderer;
 
 /// Requires a validated token whose audience matches at least one accepted
 /// value.
@@ -25,13 +25,13 @@ use crate::response::ErrorBody;
 /// Prefer [`ValidatorLayer::require_audience`](super::ValidatorLayer::require_audience)
 /// or [`ValidatorLayer::require_any_audience`](super::ValidatorLayer::require_any_audience),
 /// which guarantee the ordering.
-pub struct RequireAudienceLayer<C, E: ErrorBody = ()> {
+pub struct RequireAudienceLayer<C> {
     accepted_audiences: Arc<Vec<String>>,
-    error_body: Option<E>,
+    error_body: Option<ErrorBodyRenderer>,
     phantom: PhantomData<fn() -> C>,
 }
 
-impl<C, E: ErrorBody> Clone for RequireAudienceLayer<C, E> {
+impl<C> Clone for RequireAudienceLayer<C> {
     fn clone(&self) -> Self {
         Self {
             accepted_audiences: self.accepted_audiences.clone(),
@@ -59,8 +59,11 @@ impl<C> RequireAudienceLayer<C> {
     }
 }
 
-impl<C, E: ErrorBody> RequireAudienceLayer<C, E> {
-    pub(crate) fn with_options(accepted_audiences: Vec<String>, error_body: Option<E>) -> Self {
+impl<C> RequireAudienceLayer<C> {
+    pub(crate) fn with_options(
+        accepted_audiences: Vec<String>,
+        error_body: Option<ErrorBodyRenderer>,
+    ) -> Self {
         Self {
             accepted_audiences: Arc::new(accepted_audiences),
             error_body,
@@ -69,8 +72,8 @@ impl<C, E: ErrorBody> RequireAudienceLayer<C, E> {
     }
 }
 
-impl<C, E: ErrorBody, S> Layer<S> for RequireAudienceLayer<C, E> {
-    type Service = RequireAudienceService<C, E, S>;
+impl<C, S> Layer<S> for RequireAudienceLayer<C> {
+    type Service = RequireAudienceService<C, S>;
 
     fn layer(&self, inner: S) -> Self::Service {
         RequireAudienceService {
@@ -83,14 +86,14 @@ impl<C, E: ErrorBody, S> Layer<S> for RequireAudienceLayer<C, E> {
 }
 
 /// The [`Service`] produced by [`RequireAudienceLayer`].
-pub struct RequireAudienceService<C, E: ErrorBody, S> {
+pub struct RequireAudienceService<C, S> {
     inner: S,
     accepted_audiences: Arc<Vec<String>>,
-    error_body: Option<E>,
+    error_body: Option<ErrorBodyRenderer>,
     phantom: PhantomData<fn() -> C>,
 }
 
-impl<C, E: ErrorBody, S: Clone> Clone for RequireAudienceService<C, E, S> {
+impl<C, S: Clone> Clone for RequireAudienceService<C, S> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -101,10 +104,9 @@ impl<C, E: ErrorBody, S: Clone> Clone for RequireAudienceService<C, E, S> {
     }
 }
 
-impl<C, E, S> Service<Request> for RequireAudienceService<C, E, S>
+impl<C, S> Service<Request> for RequireAudienceService<C, S>
 where
     C: Send + Sync + 'static,
-    E: ErrorBody,
     S: Service<Request, Response = Response> + Clone + Send + 'static,
     S::Future: Send + 'static,
 {
@@ -134,7 +136,7 @@ where
 
             let Some(token) = req.extensions().get::<ValidatedToken<C>>() else {
                 return Ok(challenge_response(
-                    &error_body,
+                    error_body.as_ref(),
                     StatusCode::UNAUTHORIZED,
                     &FailureDetails::unauthenticated(),
                     validator_data.inner.unauthenticated_challenges(None),
@@ -160,7 +162,7 @@ where
                     required_scopes: None,
                 };
                 return Ok(challenge_response(
-                    &error_body,
+                    error_body.as_ref(),
                     StatusCode::UNAUTHORIZED,
                     &details,
                     challenges,

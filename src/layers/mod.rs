@@ -7,9 +7,7 @@
 //! [`ValidatorLayer::authorize`] for order-safe protection in one layer. The
 //! individual enforcement layers remain available for advanced compositions.
 
-use huskarl_resource_server::validator::{
-    AccessTokenValidator, metadata::ProvideValidatorMetadata,
-};
+use huskarl_resource_server::validator::ValidatedRequest;
 use tower::Layer;
 
 pub use require_audience::{RequireAudienceLayer, RequireAudienceService};
@@ -18,8 +16,6 @@ pub use require_scopes::{HasScopes, RequireScopesLayer, RequireScopesService};
 pub use validator::{InvalidBaseUrl, InvalidResourceIdentifier, ValidatorLayer, ValidatorService};
 
 pub use authorize::{AuthorizationError, AuthorizeLayer, AuthorizeService};
-
-use crate::response::ErrorBody;
 
 mod authorize;
 mod require_audience;
@@ -35,22 +31,21 @@ mod tests;
 /// Construct this with [`ValidatorLayer::authenticated`] or
 /// [`ValidatorLayer::with_protected_resource`]. Router placement determines
 /// which endpoints it protects; a configured resource URL does not filter paths.
-pub struct AuthenticatedLayer<V: ProvideValidatorMetadata, E: ErrorBody = ()> {
-    validator: ValidatorLayer<V, E>,
+pub struct AuthenticatedLayer<C> {
+    validator: ValidatorLayer<C>,
 }
 
-impl<V: ProvideValidatorMetadata, E: ErrorBody> AuthenticatedLayer<V, E> {
-    pub(crate) fn new(validator: ValidatorLayer<V, E>) -> Self {
+impl<C: Send + Sync + 'static> AuthenticatedLayer<C> {
+    pub(crate) fn new(validator: ValidatorLayer<C>) -> Self {
         Self { validator }
     }
 
     /// Requires every supplied scope in addition to authentication and any
     /// configured resource audience binding.
     #[must_use]
-    pub fn require_scopes<I, T>(&self, required_scopes: I) -> ScopedLayer<V, E>
+    pub fn require_scopes<I, T>(&self, required_scopes: I) -> ScopedLayer<C>
     where
-        V: AccessTokenValidator,
-        V::Claims: HasScopes,
+        C: HasScopes,
         I: IntoIterator<Item = T>,
         T: Into<String>,
     {
@@ -60,21 +55,15 @@ impl<V: ProvideValidatorMetadata, E: ErrorBody> AuthenticatedLayer<V, E> {
     /// Applies a custom permission check after token and resource audience
     /// validation. Requests without a token are rejected before the check.
     #[must_use]
-    pub fn authorize<F>(&self, check: F) -> AuthorizedLayer<V, F, E>
+    pub fn authorize<F>(&self, check: F) -> AuthorizedLayer<C>
     where
-        V: AccessTokenValidator,
-        F: Fn(
-                &huskarl_resource_server::validator::ValidatedRequest<V::Claims>,
-            ) -> Result<(), AuthorizationError>
-            + Send
-            + Sync
-            + 'static,
+        F: Fn(&ValidatedRequest<C>) -> Result<(), AuthorizationError> + Send + Sync + 'static,
     {
         self.validator.authorize(check)
     }
 }
 
-impl<V: ProvideValidatorMetadata, E: ErrorBody> Clone for AuthenticatedLayer<V, E> {
+impl<C> Clone for AuthenticatedLayer<C> {
     fn clone(&self) -> Self {
         Self {
             validator: self.validator.clone(),
@@ -82,13 +71,8 @@ impl<V: ProvideValidatorMetadata, E: ErrorBody> Clone for AuthenticatedLayer<V, 
     }
 }
 
-impl<V, E, S> Layer<S> for AuthenticatedLayer<V, E>
-where
-    V: AccessTokenValidator + ProvideValidatorMetadata,
-    E: ErrorBody,
-    S: Clone,
-{
-    type Service = ValidatorService<V, E, RequireAuthenticatedService<E, S>>;
+impl<C: Send + Sync + 'static, S> Layer<S> for AuthenticatedLayer<C> {
+    type Service = ValidatorService<C, RequireAuthenticatedService<S>>;
 
     fn layer(&self, inner: S) -> Self::Service {
         self.validator
@@ -100,13 +84,13 @@ where
 ///
 /// Construct this with [`ValidatorLayer::require_audience`] or
 /// [`ValidatorLayer::require_any_audience`].
-pub struct AudienceLayer<V: ProvideValidatorMetadata, E: ErrorBody = ()> {
-    validator: ValidatorLayer<V, E>,
+pub struct AudienceLayer<C> {
+    validator: ValidatorLayer<C>,
     accepted_audiences: Vec<String>,
 }
 
-impl<V: ProvideValidatorMetadata, E: ErrorBody> AudienceLayer<V, E> {
-    pub(crate) fn new(validator: ValidatorLayer<V, E>, accepted_audiences: Vec<String>) -> Self {
+impl<C> AudienceLayer<C> {
+    pub(crate) fn new(validator: ValidatorLayer<C>, accepted_audiences: Vec<String>) -> Self {
         Self {
             validator,
             accepted_audiences,
@@ -114,7 +98,7 @@ impl<V: ProvideValidatorMetadata, E: ErrorBody> AudienceLayer<V, E> {
     }
 }
 
-impl<V: ProvideValidatorMetadata, E: ErrorBody> Clone for AudienceLayer<V, E> {
+impl<C> Clone for AudienceLayer<C> {
     fn clone(&self) -> Self {
         Self {
             validator: self.validator.clone(),
@@ -123,13 +107,8 @@ impl<V: ProvideValidatorMetadata, E: ErrorBody> Clone for AudienceLayer<V, E> {
     }
 }
 
-impl<V, E, S> Layer<S> for AudienceLayer<V, E>
-where
-    V: AccessTokenValidator + ProvideValidatorMetadata,
-    E: ErrorBody,
-    S: Clone,
-{
-    type Service = ValidatorService<V, E, RequireAudienceService<V::Claims, E, S>>;
+impl<C: Send + Sync + 'static, S> Layer<S> for AudienceLayer<C> {
+    type Service = ValidatorService<C, RequireAudienceService<C, S>>;
 
     fn layer(&self, inner: S) -> Self::Service {
         self.validator.layer(
@@ -144,19 +123,15 @@ where
 /// check.
 ///
 /// Construct this with [`ValidatorLayer::authorize`]. The check receives the
-/// validator's normalized [`ValidatedRequest`](huskarl_resource_server::validator::ValidatedRequest),
+/// validator's normalized [`ValidatedRequest`],
 /// including its issuer and audience fields.
-pub struct AuthorizedLayer<V: AccessTokenValidator + ProvideValidatorMetadata, F, E: ErrorBody = ()>
-{
-    validator: ValidatorLayer<V, E>,
-    authorization: AuthorizeLayer<V::Claims, F, E>,
+pub struct AuthorizedLayer<C> {
+    validator: ValidatorLayer<C>,
+    authorization: AuthorizeLayer<C>,
 }
 
-impl<V: AccessTokenValidator + ProvideValidatorMetadata, F, E: ErrorBody> AuthorizedLayer<V, F, E> {
-    pub(crate) fn new(
-        validator: ValidatorLayer<V, E>,
-        authorization: AuthorizeLayer<V::Claims, F, E>,
-    ) -> Self {
+impl<C> AuthorizedLayer<C> {
+    pub(crate) fn new(validator: ValidatorLayer<C>, authorization: AuthorizeLayer<C>) -> Self {
         Self {
             validator,
             authorization,
@@ -164,9 +139,7 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata, F, E: ErrorBody> Author
     }
 }
 
-impl<V: AccessTokenValidator + ProvideValidatorMetadata, F, E: ErrorBody> Clone
-    for AuthorizedLayer<V, F, E>
-{
+impl<C> Clone for AuthorizedLayer<C> {
     fn clone(&self) -> Self {
         Self {
             validator: self.validator.clone(),
@@ -175,19 +148,8 @@ impl<V: AccessTokenValidator + ProvideValidatorMetadata, F, E: ErrorBody> Clone
     }
 }
 
-impl<V, F, E, S> Layer<S> for AuthorizedLayer<V, F, E>
-where
-    V: AccessTokenValidator + ProvideValidatorMetadata,
-    F: Fn(
-            &huskarl_resource_server::validator::ValidatedRequest<V::Claims>,
-        ) -> Result<(), AuthorizationError>
-        + Send
-        + Sync
-        + 'static,
-    E: ErrorBody,
-    S: Clone,
-{
-    type Service = ValidatorService<V, E, AuthorizeService<V::Claims, F, E, S>>;
+impl<C, S> Layer<S> for AuthorizedLayer<C> {
+    type Service = ValidatorService<C, AuthorizeService<C, S>>;
 
     fn layer(&self, inner: S) -> Self::Service {
         self.validator.layer(self.authorization.layer(inner))
@@ -198,13 +160,13 @@ where
 ///
 /// Construct this with [`ValidatorLayer::require_scopes`]. The claims type is
 /// derived from the validator, preventing a mismatched scope layer.
-pub struct ScopedLayer<V: ProvideValidatorMetadata, E: ErrorBody = ()> {
-    validator: ValidatorLayer<V, E>,
+pub struct ScopedLayer<C> {
+    validator: ValidatorLayer<C>,
     required_scopes: Vec<String>,
 }
 
-impl<V: ProvideValidatorMetadata, E: ErrorBody> ScopedLayer<V, E> {
-    pub(crate) fn new(validator: ValidatorLayer<V, E>, required_scopes: Vec<String>) -> Self {
+impl<C> ScopedLayer<C> {
+    pub(crate) fn new(validator: ValidatorLayer<C>, required_scopes: Vec<String>) -> Self {
         Self {
             validator,
             required_scopes,
@@ -212,7 +174,7 @@ impl<V: ProvideValidatorMetadata, E: ErrorBody> ScopedLayer<V, E> {
     }
 }
 
-impl<V: ProvideValidatorMetadata, E: ErrorBody> Clone for ScopedLayer<V, E> {
+impl<C> Clone for ScopedLayer<C> {
     fn clone(&self) -> Self {
         Self {
             validator: self.validator.clone(),
@@ -221,14 +183,8 @@ impl<V: ProvideValidatorMetadata, E: ErrorBody> Clone for ScopedLayer<V, E> {
     }
 }
 
-impl<V, E, S> Layer<S> for ScopedLayer<V, E>
-where
-    V: AccessTokenValidator + ProvideValidatorMetadata,
-    V::Claims: HasScopes,
-    E: ErrorBody,
-    S: Clone,
-{
-    type Service = ValidatorService<V, E, RequireScopesService<V::Claims, E, S>>;
+impl<C: HasScopes + Send + Sync + 'static, S> Layer<S> for ScopedLayer<C> {
+    type Service = ValidatorService<C, RequireScopesService<C, S>>;
 
     fn layer(&self, inner: S) -> Self::Service {
         self.validator.layer(

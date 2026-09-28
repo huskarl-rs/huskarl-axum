@@ -1,4 +1,4 @@
-use std::{marker::PhantomData, pin::Pin, sync::Arc};
+use std::{pin::Pin, sync::Arc};
 
 use axum_core::{
     extract::Request,
@@ -14,7 +14,7 @@ use tower::{Layer, Service};
 use crate::extensions::ValidatorData;
 use crate::extractors::ValidatedToken;
 use crate::layers::validator::{FailureDetails, challenge_response};
-use crate::response::ErrorBody;
+use crate::response::ErrorBodyRenderer;
 
 /// A denial returned by a custom authorization check.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,77 +52,77 @@ impl std::error::Error for AuthorizationError {}
 /// This layer must be stacked inside a [`ValidatorLayer`](super::ValidatorLayer).
 /// Prefer [`ValidatorLayer::authorize`](super::ValidatorLayer::authorize),
 /// which guarantees the ordering.
-pub struct AuthorizeLayer<C, F, E: ErrorBody = ()> {
-    check: Arc<F>,
-    error_body: Option<E>,
-    phantom: PhantomData<fn() -> C>,
+pub struct AuthorizeLayer<C> {
+    check: AuthorizationCheck<C>,
+    error_body: Option<ErrorBodyRenderer>,
 }
 
-impl<C, F> AuthorizeLayer<C, F> {
+/// A type-erased custom authorization check.
+type AuthorizationCheck<C> =
+    Arc<dyn Fn(&ValidatedRequest<C>) -> Result<(), AuthorizationError> + Send + Sync>;
+
+impl<C> AuthorizeLayer<C> {
     /// Creates a custom authorization layer.
     #[must_use]
-    pub fn new(check: F) -> Self {
+    pub fn new<F>(check: F) -> Self
+    where
+        F: Fn(&ValidatedRequest<C>) -> Result<(), AuthorizationError> + Send + Sync + 'static,
+    {
         Self::with_options(check, None)
     }
-}
 
-impl<C, F, E: ErrorBody> AuthorizeLayer<C, F, E> {
-    pub(crate) fn with_options(check: F, error_body: Option<E>) -> Self {
+    pub(crate) fn with_options<F>(check: F, error_body: Option<ErrorBodyRenderer>) -> Self
+    where
+        F: Fn(&ValidatedRequest<C>) -> Result<(), AuthorizationError> + Send + Sync + 'static,
+    {
         Self {
             check: Arc::new(check),
             error_body,
-            phantom: PhantomData,
         }
     }
 }
 
-impl<C, F, E: ErrorBody> Clone for AuthorizeLayer<C, F, E> {
+impl<C> Clone for AuthorizeLayer<C> {
     fn clone(&self) -> Self {
         Self {
             check: self.check.clone(),
             error_body: self.error_body.clone(),
-            phantom: PhantomData,
         }
     }
 }
 
-impl<C, F, E: ErrorBody, S> Layer<S> for AuthorizeLayer<C, F, E> {
-    type Service = AuthorizeService<C, F, E, S>;
+impl<C, S> Layer<S> for AuthorizeLayer<C> {
+    type Service = AuthorizeService<C, S>;
 
     fn layer(&self, inner: S) -> Self::Service {
         AuthorizeService {
             inner,
             check: self.check.clone(),
             error_body: self.error_body.clone(),
-            phantom: PhantomData,
         }
     }
 }
 
 /// The [`Service`] produced by [`AuthorizeLayer`].
-pub struct AuthorizeService<C, F, E: ErrorBody, S> {
+pub struct AuthorizeService<C, S> {
     inner: S,
-    check: Arc<F>,
-    error_body: Option<E>,
-    phantom: PhantomData<fn() -> C>,
+    check: AuthorizationCheck<C>,
+    error_body: Option<ErrorBodyRenderer>,
 }
 
-impl<C, F, E: ErrorBody, S: Clone> Clone for AuthorizeService<C, F, E, S> {
+impl<C, S: Clone> Clone for AuthorizeService<C, S> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
             check: self.check.clone(),
             error_body: self.error_body.clone(),
-            phantom: PhantomData,
         }
     }
 }
 
-impl<C, F, E, S> Service<Request> for AuthorizeService<C, F, E, S>
+impl<C, S> Service<Request> for AuthorizeService<C, S>
 where
     C: Send + Sync + 'static,
-    E: ErrorBody,
-    F: Fn(&ValidatedRequest<C>) -> Result<(), AuthorizationError> + Send + Sync + 'static,
     S: Service<Request, Response = Response> + Clone + Send + 'static,
     S::Future: Send + 'static,
 {
@@ -152,7 +152,7 @@ where
 
             let Some(token) = req.extensions().get::<ValidatedToken<C>>() else {
                 return Ok(challenge_response(
-                    &error_body,
+                    error_body.as_ref(),
                     StatusCode::UNAUTHORIZED,
                     &FailureDetails::unauthenticated(),
                     validator_data.inner.unauthenticated_challenges(None),
@@ -189,7 +189,7 @@ where
                 required_scopes: None,
             };
             Ok(challenge_response(
-                &error_body,
+                error_body.as_ref(),
                 status,
                 &details,
                 challenges,

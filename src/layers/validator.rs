@@ -4,8 +4,11 @@ use axum_core::{extract::Request, response::IntoResponse, response::Response};
 use http::Uri;
 use huskarl_resource_server::{
     core::resource_metadata::well_known_url,
-    error::{ToRfc6750Error as _, TokenErrorCode, TokenValidationError},
-    validator::{AccessTokenValidator, metadata::ProvideValidatorMetadata},
+    error::{ToRfc6750Error, TokenErrorCode, TokenValidationError},
+    validator::{
+        AccessTokenValidator, ValidatedRequest, ValidationResult,
+        metadata::{ProvideValidatorMetadata, ValidatorMetadata},
+    },
 };
 use tower::{Layer, Service};
 
@@ -180,24 +183,21 @@ fn parse_resource_identifier(value: &str) -> Result<String, InvalidResourceIdent
 /// state, even when they use different claims types. If the inner validator
 /// finds no token, downstream gates and extractors see an unauthenticated
 /// request; they cannot reuse the outer validator's token.
-pub struct ValidatorLayer<V: ProvideValidatorMetadata, E: ErrorBody = ()> {
-    config: Arc<ValidatorConfig<V>>,
+pub struct ValidatorLayer<C> {
+    config: Arc<ValidatorConfig<C>>,
     validator_data: ValidatorData,
-    error_body: Option<E>,
-    extractor_error_body: Option<ErrorBodyRenderer>,
+    error_body: Option<ErrorBodyRenderer>,
     resource_audiences: Option<Arc<Vec<String>>>,
 }
 
 #[bon::bon]
-impl<V: ProvideValidatorMetadata, E: ErrorBody> ValidatorLayer<V, E> {
-    #[builder(
-        start_fn(vis = "", name = __builder),
-        generics(setters(name = "set_{}", vis = "")),
-    )]
+impl<C: Send + Sync + 'static> ValidatorLayer<C> {
+    #[builder]
     /// Builds a [`ValidatorLayer`]; invoked via [`builder`](Self::builder).
     ///
-    /// `validator` performs the actual token validation; a custom `error_body`
-    /// attaches a body to challenge responses.
+    /// `validator` performs the actual token validation and fixes the layer's
+    /// claims type `C`; a custom `error_body` attaches a body to challenge
+    /// responses.
     ///
     /// `base_url` is this integration's externally visible mount URL, e.g.
     /// `https://api.example.com/gateway`. Its path is the public prefix prepended
@@ -224,17 +224,20 @@ impl<V: ProvideValidatorMetadata, E: ErrorBody> ValidatorLayer<V, E> {
     /// validator fails closed with an integration error rather than checking
     /// `htu`. See the huskarl-resource-server `DPoP` how-to guide for
     /// reconstructing the public URL behind a proxy.
-    pub fn new(
+    pub fn new<V>(
         validator: V,
         #[builder(with = |base_url: impl AsRef<str>| -> Result<_, InvalidBaseUrl> {
             parse_base_url(base_url.as_ref())
         })]
         base_url: Option<Uri>,
-        #[builder(setters(name = error_body_internal, vis = ""))] error_body: Option<E>,
-    ) -> Self {
+        #[builder(with = |error_body: impl ErrorBody| ErrorBodyRenderer::new(error_body))]
+        error_body: Option<ErrorBodyRenderer>,
+    ) -> Self
+    where
+        V: AccessTokenValidator<Claims = C, Error: 'static> + ProvideValidatorMetadata + 'static,
+    {
         let validator_metadata = validator.validator_metadata(None);
-
-        let extractor_error_body = error_body.clone().map(ErrorBodyRenderer::new);
+        let validator: Box<dyn DynValidator<C>> = Box::new(validator);
 
         Self {
             config: Arc::new(ValidatorConfig {
@@ -245,39 +248,12 @@ impl<V: ProvideValidatorMetadata, E: ErrorBody> ValidatorLayer<V, E> {
                 inner: Arc::new(validator_metadata),
             },
             error_body,
-            extractor_error_body,
             resource_audiences: None,
         }
     }
 }
 
-/// Public builder start — always begins with `E = ()`.
-impl<V: ProvideValidatorMetadata> ValidatorLayer<V> {
-    /// Begins building a [`ValidatorLayer`], starting with the default (empty)
-    /// error body.
-    pub fn builder() -> ValidatorLayerBuilder<V, ()> {
-        ValidatorLayer::<V, ()>::__builder()
-    }
-}
-
-// Glob-import the bon-generated builder state module by design.
-#[allow(clippy::wildcard_imports)]
-use validator_layer_builder::*;
-
-/// Custom `error_body` setter that transitions `E` to the provided type.
-impl<V: ProvideValidatorMetadata, E: ErrorBody, S: State> ValidatorLayerBuilder<V, E, S> {
-    pub fn error_body<NewE: ErrorBody>(
-        self,
-        error_body: NewE,
-    ) -> ValidatorLayerBuilder<V, NewE, SetErrorBody<S>>
-    where
-        S::ErrorBody: IsUnset,
-    {
-        self.set_e().error_body_internal(error_body)
-    }
-}
-
-impl<V: ProvideValidatorMetadata, E: ErrorBody> ValidatorLayer<V, E> {
+impl<C: Send + Sync + 'static> ValidatorLayer<C> {
     /// Configures an RFC 9728 resource and requires an audience-matching token.
     ///
     /// Returns a complete authentication layer and the metadata service. Install
@@ -330,7 +306,7 @@ impl<V: ProvideValidatorMetadata, E: ErrorBody> ValidatorLayer<V, E> {
         resource_path: impl AsRef<str>,
         audience_binding: AudienceBinding,
         scopes_supported: I,
-    ) -> Result<(AuthenticatedLayer<V, E>, ResourceMetadataService), ResourceMetadataError>
+    ) -> Result<(AuthenticatedLayer<C>, ResourceMetadataService), ResourceMetadataError>
     where
         I: IntoIterator<Item = T>,
         T: Into<String>,
@@ -458,7 +434,7 @@ impl<V: ProvideValidatorMetadata, E: ErrorBody> ValidatorLayer<V, E> {
     /// [`RequireAuthenticatedLayer`](super::RequireAuthenticatedLayer), this
     /// composite cannot be put in the wrong order.
     #[must_use]
-    pub fn authenticated(&self) -> AuthenticatedLayer<V, E> {
+    pub fn authenticated(&self) -> AuthenticatedLayer<C> {
         AuthenticatedLayer::new(self.clone())
     }
 
@@ -468,19 +444,15 @@ impl<V: ProvideValidatorMetadata, E: ErrorBody> ValidatorLayer<V, E> {
     /// [`ValidatedToken`], so this works the same way for JWT, opaque, and
     /// multi-source validators. A mismatch returns `401 invalid_token`.
     #[must_use]
-    pub fn require_audience(&self, accepted_audience: impl Into<String>) -> AudienceLayer<V, E>
-    where
-        V: AccessTokenValidator,
-    {
+    pub fn require_audience(&self, accepted_audience: impl Into<String>) -> AudienceLayer<C> {
         AudienceLayer::new(self.clone(), vec![accepted_audience.into()])
     }
 
     /// Returns an order-safe layer accepting a token that contains at least
     /// one of the supplied audience values (OR-combined).
     #[must_use]
-    pub fn require_any_audience<I, T>(&self, accepted_audiences: I) -> AudienceLayer<V, E>
+    pub fn require_any_audience<I, T>(&self, accepted_audiences: I) -> AudienceLayer<C>
     where
-        V: AccessTokenValidator,
         I: IntoIterator<Item = T>,
         T: Into<String>,
     {
@@ -497,9 +469,8 @@ impl<V: ProvideValidatorMetadata, E: ErrorBody> ValidatorLayer<V, E> {
     /// [`require_any_audience`](Self::require_any_audience), which guarantee
     /// the ordering.
     #[must_use]
-    pub fn audience_layer<I, T>(&self, accepted_audiences: I) -> RequireAudienceLayer<V::Claims, E>
+    pub fn audience_layer<I, T>(&self, accepted_audiences: I) -> RequireAudienceLayer<C>
     where
-        V: AccessTokenValidator,
         I: IntoIterator<Item = T>,
         T: Into<String>,
     {
@@ -517,15 +488,9 @@ impl<V: ProvideValidatorMetadata, E: ErrorBody> ValidatorLayer<V, E> {
     /// validators. Return [`AuthorizationError::Forbidden`] for a `403` or
     /// [`AuthorizationError::InvalidToken`] for a `401`.
     #[must_use]
-    pub fn authorize<F>(&self, check: F) -> AuthorizedLayer<V, F, E>
+    pub fn authorize<F>(&self, check: F) -> AuthorizedLayer<C>
     where
-        V: AccessTokenValidator,
-        F: Fn(
-                &huskarl_resource_server::validator::ValidatedRequest<V::Claims>,
-            ) -> Result<(), AuthorizationError>
-            + Send
-            + Sync
-            + 'static,
+        F: Fn(&ValidatedRequest<C>) -> Result<(), AuthorizationError> + Send + Sync + 'static,
     {
         AuthorizedLayer::new(
             self.clone(),
@@ -538,15 +503,9 @@ impl<V: ProvideValidatorMetadata, E: ErrorBody> ValidatorLayer<V, E> {
     /// It must be placed inside this validator layer; prefer
     /// [`authorize`](Self::authorize) for an order-safe composition.
     #[must_use]
-    pub fn authorization_layer<F>(&self, check: F) -> AuthorizeLayer<V::Claims, F, E>
+    pub fn authorization_layer<F>(&self, check: F) -> AuthorizeLayer<C>
     where
-        V: AccessTokenValidator,
-        F: Fn(
-                &huskarl_resource_server::validator::ValidatedRequest<V::Claims>,
-            ) -> Result<(), AuthorizationError>
-            + Send
-            + Sync
-            + 'static,
+        F: Fn(&ValidatedRequest<C>) -> Result<(), AuthorizationError> + Send + Sync + 'static,
     {
         AuthorizeLayer::with_options(check, self.error_body.clone())
     }
@@ -557,10 +516,9 @@ impl<V: ProvideValidatorMetadata, E: ErrorBody> ValidatorLayer<V, E> {
     /// The claims type is derived from the validator itself, so scope
     /// middleware cannot accidentally inspect a different claims type.
     #[must_use]
-    pub fn require_scopes<I, T>(&self, required_scopes: I) -> ScopedLayer<V, E>
+    pub fn require_scopes<I, T>(&self, required_scopes: I) -> ScopedLayer<C>
     where
-        V: AccessTokenValidator,
-        V::Claims: HasScopes,
+        C: HasScopes,
         I: IntoIterator<Item = T>,
         T: Into<String>,
     {
@@ -576,10 +534,9 @@ impl<V: ProvideValidatorMetadata, E: ErrorBody> ValidatorLayer<V, E> {
     /// placed inside this validator layer; most applications should prefer
     /// [`require_scopes`](Self::require_scopes), which guarantees the order.
     #[must_use]
-    pub fn scope_layer<I, T>(&self, required_scopes: I) -> RequireScopesLayer<V::Claims, E>
+    pub fn scope_layer<I, T>(&self, required_scopes: I) -> RequireScopesLayer<C>
     where
-        V: AccessTokenValidator,
-        V::Claims: HasScopes,
+        C: HasScopes,
         I: IntoIterator<Item = T>,
         T: Into<String>,
     {
@@ -600,27 +557,76 @@ impl<V: ProvideValidatorMetadata, E: ErrorBody> ValidatorLayer<V, E> {
     /// [`authenticated`](Self::authenticated) unless manually composing nested
     /// auth middleware.
     #[must_use]
-    pub fn require_authenticated(&self) -> super::RequireAuthenticatedLayer<E> {
+    pub fn require_authenticated(&self) -> super::RequireAuthenticatedLayer {
         super::RequireAuthenticatedLayer::with_options(self.error_body.clone())
     }
 }
 
-impl<V: ProvideValidatorMetadata, E: ErrorBody> Clone for ValidatorLayer<V, E> {
+impl<C> Clone for ValidatorLayer<C> {
     fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),
             validator_data: self.validator_data.clone(),
             error_body: self.error_body.clone(),
-            extractor_error_body: self.extractor_error_body.clone(),
             resource_audiences: self.resource_audiences.clone(),
         }
     }
 }
 
+/// An [`AccessTokenValidator`] with its concrete type and error type erased,
+/// so layers are generic only over the claims type.
+///
+/// Each validation call wraps the validator's existing boxed future in another
+/// boxed future to erase the error type. Failed validations also box the error.
+pub(crate) trait DynValidator<C>: Send + Sync {
+    fn validate_request<'a>(
+        &'a self,
+        headers: &'a http::HeaderMap,
+        method: &'a http::Method,
+        uri: &'a Uri,
+        client_cert_der: Option<&'a [u8]>,
+    ) -> ErasedValidation<'a, C>;
+
+    fn validator_metadata(&self, resource: Option<&str>) -> ValidatorMetadata;
+}
+
+impl<V> DynValidator<V::Claims> for V
+where
+    V: AccessTokenValidator + ProvideValidatorMetadata + Send + Sync,
+    V::Error: 'static,
+{
+    fn validate_request<'a>(
+        &'a self,
+        headers: &'a http::HeaderMap,
+        method: &'a http::Method,
+        uri: &'a Uri,
+        client_cert_der: Option<&'a [u8]>,
+    ) -> ErasedValidation<'a, V::Claims> {
+        let validation =
+            AccessTokenValidator::validate_request(self, headers, method, uri, client_cert_der);
+        Box::pin(async move {
+            let result = validation.await;
+            ValidationResult {
+                outcome: result
+                    .outcome
+                    .map_err(|err| Box::new(err) as Box<dyn ToRfc6750Error>),
+                dpop_nonce: result.dpop_nonce,
+            }
+        })
+    }
+
+    fn validator_metadata(&self, resource: Option<&str>) -> ValidatorMetadata {
+        ProvideValidatorMetadata::validator_metadata(self, resource)
+    }
+}
+
+/// A boxed validation future with the validator's error type erased.
+type ErasedValidation<'a, C> =
+    Pin<Box<dyn Future<Output = ValidationResult<C, Box<dyn ToRfc6750Error>>> + Send + 'a>>;
+
 /// Shared, immutable validator state, held in an `Arc` by the layer and service.
-#[derive(Debug)]
-struct ValidatorConfig<V: ProvideValidatorMetadata> {
-    validator: V,
+struct ValidatorConfig<C> {
+    validator: Box<dyn DynValidator<C>>,
     base_url: Option<Uri>,
 }
 
@@ -644,90 +650,45 @@ fn clear_authentication<C: Send + Sync + 'static>(extensions: &mut http::Extensi
     extensions.remove::<ErrorBodyRenderer>();
 }
 
-impl<V, E, S> Layer<S> for ValidatorLayer<V, E>
-where
-    V: AccessTokenValidator + ProvideValidatorMetadata,
-    E: ErrorBody,
-    S: Clone,
-{
-    type Service = ValidatorService<V, E, S>;
+impl<C, S> Layer<S> for ValidatorLayer<C> {
+    type Service = ValidatorService<C, S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        ValidatorService::new(
+        ValidatorService {
             inner,
-            self.config.clone(),
-            self.validator_data.clone(),
-            self.error_body.clone(),
-            self.extractor_error_body.clone(),
-            self.resource_audiences.clone(),
-        )
+            config: self.config.clone(),
+            validator_data: self.validator_data.clone(),
+            error_body: self.error_body.clone(),
+            resource_audiences: self.resource_audiences.clone(),
+        }
     }
 }
 
 /// The [`Service`] produced by [`ValidatorLayer`]; you don't
 /// normally name this directly.
-pub struct ValidatorService<V, E, S>
-where
-    V: AccessTokenValidator + ProvideValidatorMetadata,
-    E: ErrorBody,
-    S: Clone,
-{
+pub struct ValidatorService<C, S> {
     inner: S,
-    config: Arc<ValidatorConfig<V>>,
+    config: Arc<ValidatorConfig<C>>,
     validator_data: ValidatorData,
-    error_body: Option<E>,
-    extractor_error_body: Option<ErrorBodyRenderer>,
+    error_body: Option<ErrorBodyRenderer>,
     resource_audiences: Option<Arc<Vec<String>>>,
 }
 
-impl<V, E, S> Clone for ValidatorService<V, E, S>
-where
-    V: AccessTokenValidator + ProvideValidatorMetadata,
-    E: ErrorBody,
-    S: Clone,
-{
+impl<C, S: Clone> Clone for ValidatorService<C, S> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
             config: self.config.clone(),
             validator_data: self.validator_data.clone(),
             error_body: self.error_body.clone(),
-            extractor_error_body: self.extractor_error_body.clone(),
             resource_audiences: self.resource_audiences.clone(),
         }
     }
 }
 
-impl<V, E, S> ValidatorService<V, E, S>
+impl<C, S> Service<Request> for ValidatorService<C, S>
 where
-    V: AccessTokenValidator + ProvideValidatorMetadata,
-    E: ErrorBody,
-    S: Clone,
-{
-    /// Constructs the service for [`ValidatorLayer`]'s [`Layer`] implementation.
-    fn new(
-        inner: S,
-        config: Arc<ValidatorConfig<V>>,
-        validator_data: ValidatorData,
-        error_body: Option<E>,
-        extractor_error_body: Option<ErrorBodyRenderer>,
-        resource_audiences: Option<Arc<Vec<String>>>,
-    ) -> Self {
-        Self {
-            inner,
-            config,
-            validator_data,
-            error_body,
-            extractor_error_body,
-            resource_audiences,
-        }
-    }
-}
-
-impl<V, E, S> Service<Request> for ValidatorService<V, E, S>
-where
-    V: AccessTokenValidator + ProvideValidatorMetadata + 'static,
-    E: ErrorBody,
+    C: Send + Sync + 'static,
     S: Service<Request, Response = Response> + Clone + Send + 'static,
     S::Future: Send + 'static,
 {
@@ -748,7 +709,6 @@ where
         let config = self.config.clone();
         let validator_data = self.validator_data.clone();
         let error_body = self.error_body.clone();
-        let extractor_error_body = self.extractor_error_body.clone();
         let resource_audiences = self.resource_audiences.clone();
 
         Box::pin(async move {
@@ -762,9 +722,9 @@ where
                 return Ok(response.into_response());
             };
 
-            clear_authentication::<V::Claims>(req.extensions_mut());
+            clear_authentication::<C>(req.extensions_mut());
             req.extensions_mut().insert(validator_data.clone());
-            if let Some(renderer) = extractor_error_body {
+            if let Some(renderer) = error_body.clone() {
                 req.extensions_mut().insert(renderer);
             }
 
@@ -805,7 +765,7 @@ where
                             required_scopes: None,
                         };
                         return Ok(challenge_response(
-                            &error_body,
+                            error_body.as_ref(),
                             http::StatusCode::UNAUTHORIZED,
                             &details,
                             challenges,
@@ -817,12 +777,13 @@ where
                     req.extensions_mut()
                         .insert(ValidatedToken(Arc::new(validated_request)));
                     req.extensions_mut()
-                        .insert(ValidatedTokenCleanup(remove_validated_token::<V::Claims>));
+                        .insert(ValidatedTokenCleanup(remove_validated_token::<C>));
                 }
                 Ok(None) => {}
                 Err(err) => {
                     let challenge = err.challenge();
-                    let mut rejection = validator_data.inner.rejection_from(&err, &challenge, None);
+                    let mut rejection =
+                        validator_data.inner.rejection_from(&*err, &challenge, None);
                     rejection.dpop_nonce = dpop_nonce;
                     // Server-side failures deliberately reveal no error details
                     // (see `TokenValidationError`); pass none to the body either.
@@ -835,7 +796,7 @@ where
                         TokenValidationError::Server { .. } => FailureDetails::unauthenticated(),
                     };
                     return Ok(challenge_response(
-                        &error_body,
+                        error_body.as_ref(),
                         rejection.status,
                         &details,
                         rejection.www_authenticate,
@@ -879,49 +840,35 @@ impl FailureDetails {
     }
 }
 
-// `&Option<E>` matches how callers hold `error_body`; no need to map to `Option<&E>`.
-#[allow(clippy::ref_option)]
-pub(crate) fn challenge_response<E: ErrorBody>(
-    error_body: &Option<E>,
+pub(crate) fn challenge_response(
+    error_body: Option<&ErrorBodyRenderer>,
     status: http::StatusCode,
     details: &FailureDetails,
     challenges: Vec<String>,
     dpop_nonce: Option<String>,
     retry_after: Option<huskarl_resource_server::core::platform::Duration>,
 ) -> Response {
-    match error_body {
-        Some(eb) => {
-            let body = eb.error_body(&ErrorDetails {
-                status,
-                error_code: details.error_code,
-                error_description: details.error_description.as_deref(),
-                required_scopes: details.required_scopes.as_deref().map(Vec::as_slice),
-                challenges: &challenges,
-            });
-            ChallengeResponse {
-                status,
-                challenges,
-                dpop_nonce,
-                retry_after,
-                body,
-            }
-            .into_response()
-        }
-        None => ChallengeResponse {
+    let body = match error_body {
+        Some(renderer) => renderer.render(&ErrorDetails {
             status,
-            challenges,
-            dpop_nonce,
-            retry_after,
-            body: (),
-        }
-        .into_response(),
+            error_code: details.error_code,
+            error_description: details.error_description.as_deref(),
+            required_scopes: details.required_scopes.as_deref().map(Vec::as_slice),
+            challenges: &challenges,
+        }),
+        None => ().into_response(),
+    };
+    ChallengeResponse {
+        status,
+        challenges,
+        dpop_nonce,
+        retry_after,
+        body,
     }
+    .into_response()
 }
 
-fn get_request_uri<V: ProvideValidatorMetadata>(
-    config: &ValidatorConfig<V>,
-    req: &Request,
-) -> Option<Uri> {
+fn get_request_uri<C>(config: &ValidatorConfig<C>, req: &Request) -> Option<Uri> {
     if let Some(request_url) = req.extensions().get::<RequestUrl>() {
         return Some(request_url.0.clone());
     }

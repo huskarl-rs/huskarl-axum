@@ -9,7 +9,7 @@ use tower::{Layer, Service};
 
 use crate::extensions::{HasValidToken, ValidatorData};
 use crate::layers::validator::{FailureDetails, challenge_response};
-use crate::response::ErrorBody;
+use crate::response::ErrorBodyRenderer;
 
 /// Rejects any request that did not arrive with a valid access token — a
 /// layer-level authentication gate.
@@ -36,8 +36,8 @@ use crate::response::ErrorBody;
 /// [`ValidatorLayer::authenticated`](super::ValidatorLayer::authenticated),
 /// which returns an order-safe composite layer.
 #[derive(Clone)]
-pub struct RequireAuthenticatedLayer<E: ErrorBody = ()> {
-    error_body: Option<E>,
+pub struct RequireAuthenticatedLayer {
+    error_body: Option<ErrorBodyRenderer>,
 }
 
 impl RequireAuthenticatedLayer {
@@ -58,14 +58,14 @@ impl Default for RequireAuthenticatedLayer {
     }
 }
 
-impl<E: ErrorBody> RequireAuthenticatedLayer<E> {
-    pub(crate) fn with_options(error_body: Option<E>) -> Self {
+impl RequireAuthenticatedLayer {
+    pub(crate) fn with_options(error_body: Option<ErrorBodyRenderer>) -> Self {
         Self { error_body }
     }
 }
 
-impl<E: ErrorBody, S> Layer<S> for RequireAuthenticatedLayer<E> {
-    type Service = RequireAuthenticatedService<E, S>;
+impl<S> Layer<S> for RequireAuthenticatedLayer {
+    type Service = RequireAuthenticatedService<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
         RequireAuthenticatedService {
@@ -78,16 +78,15 @@ impl<E: ErrorBody, S> Layer<S> for RequireAuthenticatedLayer<E> {
 /// The [`Service`] produced by [`RequireAuthenticatedLayer`]; you don't normally
 /// name this directly.
 #[derive(Clone)]
-pub struct RequireAuthenticatedService<E: ErrorBody, S> {
+pub struct RequireAuthenticatedService<S> {
     inner: S,
-    error_body: Option<E>,
+    error_body: Option<ErrorBodyRenderer>,
 }
 
-impl<E, S> Service<Request> for RequireAuthenticatedService<E, S>
+impl<S> Service<Request> for RequireAuthenticatedService<S>
 where
     S: Service<Request, Response = Response> + Send + Clone + 'static,
     S::Future: Send + 'static,
-    E: ErrorBody,
 {
     type Response = S::Response;
     type Error = S::Error;
@@ -127,7 +126,7 @@ where
                     .map(|vd| vd.inner.unauthenticated_challenges(None))
                     .unwrap_or_default();
                 return Ok(challenge_response(
-                    &error_body,
+                    error_body.as_ref(),
                     StatusCode::UNAUTHORIZED,
                     &FailureDetails::unauthenticated(),
                     challenges,
