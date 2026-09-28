@@ -15,7 +15,17 @@
 //!
 //! # Quick start (everything protected)
 //!
-//! ```ignore
+//! ```
+//! use axum::{Router, routing::get};
+//! use huskarl_axum::login::{CookieSession, LoginLayer, LoginSession};
+//! # use huskarl::grant::authorization_code::AuthorizationCodeGrant;
+//! # use huskarl_axum::login::{ConfigError, CookieSessionStore, LoginConfig};
+//! # fn build(
+//! #     config: LoginConfig,
+//! #     grant: AuthorizationCodeGrant,
+//! #     session_store: CookieSessionStore,
+//! # ) -> Result<Router, ConfigError> {
+//!
 //! let login = LoginLayer::builder()
 //!     .config(config)
 //!     .grant(grant)
@@ -25,6 +35,8 @@
 //! let app = Router::new()
 //!     .route("/", get(index))
 //!     .layer(login);
+//! # Ok(app)
+//! # }
 //!
 //! async fn index(session: LoginSession<CookieSession>) -> String {
 //!     format!("Hello! Token expires: {:?}", session.token_expiry())
@@ -33,15 +45,26 @@
 //!
 //! # Mixed public/protected
 //!
-//! ```ignore
-//! let login = LoginLayer::builder()/* ... */.build()?;
+//! ```
+//! use axum::{Router, routing::get};
+//! use huskarl_axum::login::{CookieSession, CookieSessionStore, LoginLayer, LoginSession};
 //!
-//! let app = Router::new()
-//!     .route("/dashboard", get(dashboard))
-//!     .layer(login.require_session())      // gate
-//!     .route("/", get(public_home))         // public (sees session if present)
-//!     .layer(login.load_session())          // loader
-//!     .layer(login.login_routes());         // /callback, /logout
+//! fn app(login: LoginLayer<CookieSessionStore>) -> Router {
+//!     Router::new()
+//!         .route("/dashboard", get(dashboard))
+//!         .layer(login.require_session())      // gate
+//!         .route("/", get(public_home))         // public (sees session if present)
+//!         .layer(login.load_session())          // loader
+//!         .layer(login.login_routes())          // /callback, /logout
+//! }
+//!
+//! async fn dashboard(session: LoginSession<CookieSession>) -> String {
+//!     format!("Token expires: {:?}", session.token_expiry())
+//! }
+//!
+//! async fn public_home(session: Option<LoginSession<CookieSession>>) -> &'static str {
+//!     if session.is_some() { "Welcome back" } else { "Hello" }
+//! }
 //! ```
 //!
 //! # Nested routers and reverse proxies
@@ -72,7 +95,11 @@
 //! An authenticated handler can request termination of its current session
 //! without redirecting through the configured browser logout route:
 //!
-//! ```ignore
+//! ```
+//! use huskarl_axum::login::{LoginSession, SessionTermination};
+//! # type MySession = huskarl_axum::login::CookieSession;
+//! # async fn delete_account_for(_: &LoginSession<MySession>) {}
+//!
 //! async fn delete_account(
 //!     session: LoginSession<MySession>,
 //!     termination: SessionTermination,
@@ -80,6 +107,7 @@
 //!     delete_account_for(&session).await;
 //!     termination.request();
 //! }
+//! # let _: axum::routing::MethodRouter = axum::routing::post(delete_account);
 //! ```
 //!
 //! After the handler returns, the login middleware clears the browser cookies

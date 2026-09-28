@@ -278,12 +278,21 @@ where
 /// [`login_routes`](Self::login_routes), and
 /// [`require_session`](Self::require_session).
 ///
-/// ```ignore
+/// ```
+/// # use huskarl::grant::authorization_code::AuthorizationCodeGrant;
+/// # use huskarl_axum::login::{ConfigError, CookieSessionStore, LoginConfig, LoginLayer};
+/// # fn build(
+/// #     config: LoginConfig,
+/// #     grant: AuthorizationCodeGrant,
+/// #     session_store: CookieSessionStore,
+/// # ) -> Result<LoginLayer<CookieSessionStore>, ConfigError> {
 /// let login = LoginLayer::builder()
 ///     .config(config)
 ///     .grant(grant)
 ///     .session_store(session_store)
 ///     .build()?;
+/// # Ok(login)
+/// # }
 /// ```
 pub struct LoginLayer<SD> {
     engine: Arc<LoginEngine<SD>>,

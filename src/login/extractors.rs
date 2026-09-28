@@ -77,7 +77,11 @@ pub type SessionFor<S> = LoginSession<<S as HasSession>::Session>;
 /// out. This terminates the current application session only—it does not invoke
 /// an `OpenID` Provider end-session endpoint.
 ///
-/// ```ignore
+/// ```
+/// use huskarl_axum::login::{LoginSession, SessionTermination};
+/// # type MySession = huskarl_axum::login::CookieSession;
+/// # async fn delete_account_for(_: &LoginSession<MySession>) {}
+///
 /// async fn delete_account(
 ///     session: LoginSession<MySession>,
 ///     termination: SessionTermination,
@@ -85,6 +89,7 @@ pub type SessionFor<S> = LoginSession<<S as HasSession>::Session>;
 ///     delete_account_for(&session).await;
 ///     termination.request();
 /// }
+/// # let _: axum::routing::MethodRouter = axum::routing::post(delete_account);
 /// ```
 #[derive(Debug, Clone)]
 pub struct SessionTermination(Arc<AtomicBool>);
@@ -150,10 +155,13 @@ where
 ///
 /// Use this as an extractor in your handlers:
 ///
-/// ```ignore
+/// ```
+/// use huskarl_axum::login::{CookieSession, LoginSession};
+///
 /// async fn index(session: LoginSession<CookieSession>) -> String {
 ///     format!("Token expires: {:?}", session.token_expiry())
 /// }
+/// # let _: axum::routing::MethodRouter = axum::routing::get(index);
 /// ```
 ///
 /// For optional session access (never rejects), use `Option<LoginSession<S>>`.
