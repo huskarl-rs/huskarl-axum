@@ -3,6 +3,9 @@
 //! [`ChallengeResponse`] renders RFC 6750 `WWW-Authenticate` challenges (with an
 //! optional `DPoP-Nonce`); [`ErrorBody`] lets you attach a custom body to those
 //! responses, built from the structured failure details in [`ErrorDetails`].
+//!
+//! Follow [Customize authentication error responses](self::guide) for JSON and
+//! browser-login examples.
 
 use std::sync::Arc;
 
@@ -142,3 +145,8 @@ impl<B: IntoResponse> IntoResponse for ChallengeResponse<B> {
         response
     }
 }
+
+/// Configure resource-error bodies and shared browser-login error pages.
+#[cfg(any(doc, doctest))]
+#[doc = include_str!("../docs/how_to/error_responses.md")]
+pub mod guide {}

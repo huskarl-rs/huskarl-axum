@@ -10,6 +10,8 @@
 //! browser walkthrough with the runnable `login` example. Before rollout, read
 //! [Deploy browser login](self::deployment) for HTTPS, refresh concurrency,
 //! session storage, and middleware response-delivery limits.
+//! See [Customize authentication error responses](crate::response::guide) for
+//! shared login-page rendering and resource-server error bodies.
 //!
 //! # Quick start (everything protected)
 //!
