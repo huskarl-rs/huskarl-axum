@@ -2,7 +2,6 @@
 Specification compliant `OAuth2` resource server middleware for axum.
 
 - RFC 6750 error headers on authentication/authorization failure
-- WASM support
 - JWT token validation with customizable token requirements
 - Pluggable async JWT signature validation (e.g. validate from KMS)
 - Opaque token validation using `OAuth2` token introspection
