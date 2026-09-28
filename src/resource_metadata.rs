@@ -1,5 +1,8 @@
 //! RFC 9728 Protected Resource Metadata endpoint support.
 //!
+//! Follow [Publish protected-resource metadata](self::guide) for setup, multiple
+//! resources, and discovery/isolation checks.
+//!
 //! [`ResourceMetadataService`] is produced together with a configured
 //! [`AuthenticatedLayer`](crate::layers::AuthenticatedLayer) by
 //! [`ValidatorLayer::with_protected_resource`](crate::layers::ValidatorLayer::with_protected_resource).
@@ -268,3 +271,8 @@ impl Service<Request> for ResourceMetadataService {
         std::future::ready(Ok(response))
     }
 }
+
+/// Publish discovery metadata for one resource or several independent resources.
+#[cfg(any(doc, doctest))]
+#[doc = include_str!("../docs/how_to/resource_metadata.md")]
+pub mod guide {}

@@ -140,6 +140,10 @@ cargo run --example login --features login
 
 ## Protected resource metadata and authorization
 
+Follow [Publish protected-resource metadata](docs/how_to/resource_metadata.md)
+for one resource, multiple resources, and the
+[runnable two-resource example](examples/multi_resource.rs).
+
 `with_protected_resource` returns an authentication layer and a public metadata
 service. Apply the layer directly to the router containing the resource's
 endpoints, then mount metadata separately on the root router:
